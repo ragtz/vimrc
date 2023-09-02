@@ -126,7 +126,6 @@ require('lazy').setup({
     opts = {
       options = {
         icons_enabled = false,
-        theme = 'onedark',
         component_separators = '|',
         section_separators = '',
       },
@@ -171,6 +170,9 @@ require('lazy').setup({
       pcall(require('nvim-treesitter.install').update { with_sync = true })
     end,
   },
+
+  -- telescope filebrowser
+  'nvim-telescope/telescope-file-browser.nvim',
 
   -- NOTE: Next Step on Your Neovim Journey: Add/Configure additional "plugins" for kickstart
   --       These are some example plugins that I've included in the kickstart repository.
@@ -266,6 +268,21 @@ require('telescope').setup {
 
 -- Enable telescope fzf native, if installed
 pcall(require('telescope').load_extension, 'fzf')
+
+-- Enable telescope file browser
+pcall(require('telescope').load_extension, 'file_browser')
+
+-- open file_browser with the path of the current buffer
+vim.keymap.set('n', '<leader>fb', require('telescope').extensions.file_browser.file_browser, { noremap = true })
+--[[
+vim.api.nvim_set_keymap(
+  'n',
+  '<space>fb',
+  ':Telescope file_browser',
+  --":Telescope file_browser path=%:p:h select_buffer=true",
+  { noremap = true }
+)
+--]]
 
 -- See `:help telescope.builtin`
 vim.keymap.set('n', '<leader>?', require('telescope.builtin').oldfiles, { desc = '[?] Find recently opened files' })
@@ -399,6 +416,9 @@ local on_attach = function(_, bufnr)
   vim.api.nvim_buf_create_user_command(bufnr, 'Format', function(_)
     vim.lsp.buf.format()
   end, { desc = 'Format current buffer with LSP' })
+
+  -- Create a command to format selected
+  vim.keymap.set('v', '<leader>f', vim.lsp.buf.format, bufopts)
 end
 
 -- Enable the following language servers
