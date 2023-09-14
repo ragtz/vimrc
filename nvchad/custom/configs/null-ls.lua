@@ -5,7 +5,7 @@ local opts = {
   sources = {
     null_ls.builtins.formatting.black.with({
       extra_args = function()
-        return {"--max-line-length=120"}
+        return {"--line-length=120"}
       end,
     }),
     null_ls.builtins.diagnostics.mypy.with({
