@@ -9,4 +9,9 @@ lspconfig.pyright.setup({
   on_attach = on_attach,
   capabilities = capabilities,
   filetypes = {"python"},
+  root_dir = function ()
+    return vim.fs.dirname(
+      vim.fs.find({"pyproject.toml"}, {upward = true})[1]
+    )
+  end,
 })
