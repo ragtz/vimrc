@@ -74,9 +74,9 @@ local plugins = {
     "williamboman/mason.nvim",
     opts = {
       ensure_installed = {
-        "black",
+        "black@24.8.0",
         "debugpy",
-        "mypy",
+        "mypy@1.14.1",
         "ruff",
         "pyright",
         "lua-language-server",
