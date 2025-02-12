@@ -18,3 +18,4 @@ Dependencies:
 Nvim setup commands
 - :MasonInstallAll
 - :TSInstall python
+- :TSInstall cp
