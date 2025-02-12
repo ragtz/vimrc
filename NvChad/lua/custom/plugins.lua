@@ -57,17 +57,10 @@ local plugins = {
   },
   {
     "jose-elias-alvarez/null-ls.nvim",
-    ft = {"python"},
+    event = "VeryLazy",
+    ft = {"python", "cpp"},
     opts = function()
       return require "custom.configs.null-ls"
-    end,
-  },
-  {
-    "jose-elias-alvarez/null-ls.nvim",
-    event = "VeryLazy",
-    ft = {"cpp"},
-    opts = function()
-      return require "custom.configs.null-ls-cpp"
     end,
   },
   {

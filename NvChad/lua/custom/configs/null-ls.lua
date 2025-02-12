@@ -18,6 +18,7 @@ local opts = {
         return {"--line-length=120"}
       end,
     }),
+    null_ls.builtins.formatting.clang_format,
   },
   on_attach = function(client, bufnr)
     if client.supports_method("textDocument/formatting") then
