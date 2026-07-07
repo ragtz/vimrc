@@ -1,0 +1,225 @@
+#!/bin/bash
+
+# ---------------------------------------------------------------------------
+# daily: work with sections of today's Obsidian daily note.
+#
+#   daily                             -> create/open today's note
+#   daily recap                       -> full note (numbered lists)
+#   daily <section> recap             -> one section (falls back to full note)
+#   daily <section> mark <i> <state>     state: in-progress|done|forward|cancel|important
+#   daily <section> add <checkbox|bullet> "text" [--tag <tag>]
+#
+# <section> matches a heading (any level) by case-insensitive substring.
+# <i> is the list-item number as shown by recap (per-list, 1-based).
+# Checkbox glyphs follow Obsidian's convention:
+#   done -> [x]  in-progress -> [/]  forward -> [>]  cancel -> [-]  important -> [!]
+# Override the target file with $DAILY_NOTE.
+# ---------------------------------------------------------------------------
+
+_daily_file() {
+    if [ -n "$DAILY_NOTE" ]; then printf '%s\n' "$DAILY_NOTE"; return 0; fi
+    local vault rel file
+    vault="$(obsidian vault 2>/dev/null | awk -F'\t' '$1=="path"{print $2}')"
+    rel="$(obsidian daily:path 2>/dev/null)"
+    [ -n "$vault" ] && [ -n "$rel" ] || { echo "daily: could not resolve daily note path" >&2; return 1; }
+    file="$vault/$rel"
+    [ -f "$file" ] || { echo "daily: no daily note at $file" >&2; return 1; }
+    printf '%s\n' "$file"
+}
+
+_daily_usage() {
+    cat >&2 <<'EOF'
+usage:
+  daily
+  daily recap
+  daily <section> recap
+  daily <section> mark <index> <in-progress|done|forward|cancel|important>
+  daily <section> add <checkbox|bullet> "text" [--tag <tag>]
+EOF
+}
+
+_daily_recap() {
+    local file="$1" section="$2" note out result
+    note="$(cat "$file")" || return 1
+
+    result="$note"
+    if [ -n "$section" ]; then
+        out="$(printf '%s\n' "$note" | awk -v want="$section" '
+            function trim(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s }
+            BEGIN { want = tolower(trim(want)); level = 0; grab = 0 }
+            /^#{1,6}[[:space:]]/ {
+                match($0, /^#+/); h = RLENGTH; text = substr($0, h + 1)
+                if (grab && h <= level) grab = 0
+                if (!grab && index(tolower(trim(text)), want) > 0) { grab = 1; level = h; print; next }
+            }
+            grab { print }
+        ')"
+        [ -n "$out" ] && result="$out"
+    fi
+
+    if printf '%s\n' "$result" | grep -qE '^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]'; then
+        printf '%s\n' "$result" | awk '
+            /^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]/ {
+                line = $0
+                sub(/^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]+/, "", line)
+                printf "  %d. %s\n", ++n, line; next
+            }
+            { n = 0; print }
+        '
+    else
+        printf '%s\n' "$result"
+    fi
+}
+
+_daily_mark() {
+    local file="$1" section="$2" idx="$3" status="$4"
+    if [ -z "$idx" ] || [ -z "$status" ]; then _daily_usage; return 2; fi
+    case "$idx" in ''|*[!0-9]*) echo "daily: index must be a positive integer" >&2; return 2 ;; esac
+
+    local mark
+    case "$status" in
+        done)        mark='x' ;;
+        in-progress) mark='/' ;;
+        forward)     mark='>' ;;
+        cancel)      mark='-' ;;
+        important)   mark='!' ;;
+        *) echo "daily: state must be one of in-progress, done, forward, cancel, important" >&2; return 2 ;;
+    esac
+
+    local tmp; tmp="$(mktemp)"
+    WANT="$section" IDX="$idx" MARK="$mark" awk '
+        function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
+        BEGIN{ want=tolower(trim(ENVIRON["WANT"])); idx=ENVIRON["IDX"]+0; mark=ENVIRON["MARK"]
+               grab=0; level=0; n=0; found=0; marked=0; done=0 }
+        /^#{1,6}[[:space:]]/{
+            match($0,/^#+/); h=RLENGTH; text=substr($0,h+1)
+            if(grab && h<=level) grab=0
+            if(!done && !grab && index(tolower(trim(text)),want)>0){ grab=1; found=1; level=h; n=0; print; next }
+            print; next
+        }
+        {
+            if(grab && !marked){
+                if($0 ~ /^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]/){
+                    if(++n==idx){
+                        line=$0
+                        if(line ~ /^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]+\[.\]/)
+                            sub(/\[.\]/, "[" mark "]", line)
+                        else if(line ~ /^[[:space:]]*[-*+][[:space:]]+/)
+                            sub(/^[[:space:]]*[-*+][[:space:]]+/, "&[" mark "] ", line)
+                        else
+                            sub(/^[[:space:]]*[0-9]+[.)][[:space:]]+/, "&[" mark "] ", line)
+                        print line; marked=1; done=1; next
+                    }
+                } else n=0
+            }
+            print
+        }
+        END{ if(!found) exit 3; if(!marked) exit 4 }
+    ' "$file" > "$tmp"
+    local rc=$?
+    case "$rc" in
+        0) cat "$tmp" > "$file" && rm -f "$tmp" ;;
+        3) rm -f "$tmp"; echo "daily: no section matching '$section' found" >&2; return 3 ;;
+        4) rm -f "$tmp"; echo "daily: no list item #$idx under '$section'" >&2; return 4 ;;
+        *) rm -f "$tmp"; echo "daily: failed to process note" >&2; return 1 ;;
+    esac
+}
+
+_daily_add() {
+    local file="$1" section="$2"; shift 2
+    local type="$1"; shift
+    case "$type" in checkbox|bullet) ;; *) echo "daily: add type must be 'checkbox' or 'bullet'" >&2; return 2 ;; esac
+
+    local text="" tag=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --tag) tag="$2"; shift 2 ;;
+            *) text="${text:+$text }$1"; shift ;;
+        esac
+    done
+    [ -n "$text" ] || { echo "daily: add requires text" >&2; return 2; }
+
+    local marker tagpart=""
+    case "$type" in checkbox) marker='- [ ]' ;; bullet) marker='-' ;; esac
+    [ -n "$tag" ] && tagpart="#${tag#\#} "
+    local content="$marker ${tagpart}$text"
+
+    local tmp; tmp="$(mktemp)"
+    WANT="$section" ADD="$content" awk '
+        function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
+        function flush(){ print ENVIRON["ADD"]; for(i=1;i<=np;i++) print pend[i]; np=0; grab=0 }
+        BEGIN{ want=tolower(trim(ENVIRON["WANT"])); grab=0; done=0; level=0; np=0; found=0 }
+        /^#{1,6}[[:space:]]/{
+            match($0,/^#+/); h=RLENGTH; text=substr($0,h+1)
+            if(grab && h<=level) flush()
+            if(!done && !grab && index(tolower(trim(text)),want)>0){ grab=1; found=1; level=h; print; next }
+            print; next
+        }
+        {
+            if(grab){
+                if($0 ~ /^[[:space:]]*$/){ pend[++np]=$0; next }
+                for(i=1;i<=np;i++) print pend[i]; np=0; print; next
+            }
+            print
+        }
+        END{ if(grab) flush(); if(!found) exit 3 }
+    ' "$file" > "$tmp"
+    local rc=$?
+    if [ "$rc" -eq 3 ]; then
+        printf '\n## %s\n%s\n' "$section" "$content" >> "$tmp"
+    elif [ "$rc" -ne 0 ]; then
+        rm -f "$tmp"; echo "daily: failed to process note" >&2; return 1
+    fi
+    cat "$tmp" > "$file" && rm -f "$tmp"
+}
+
+daily() {
+    # bare `daily` -> create/open today's daily note
+    if [ "$#" -eq 0 ]; then
+        obsidian daily
+        return
+    fi
+
+    local file; file="$(_daily_file)" || return 1
+
+    if [ "$#" -eq 1 ] && [ "$1" = "recap" ]; then
+        _daily_recap "$file" ""; return
+    fi
+
+    local section="$1" verb="$2"
+    if [ -z "$section" ] || [ -z "$verb" ]; then _daily_usage; return 2; fi
+    shift 2
+
+    case "$verb" in
+        recap) _daily_recap "$file" "$section" ;;
+        mark)  _daily_mark  "$file" "$section" "$@" ;;
+        add)   _daily_add   "$file" "$section" "$@" ;;
+        *) echo "daily: unknown verb '$verb'" >&2; _daily_usage; return 2 ;;
+    esac
+}
+
+daily-done() {
+  if [[ $# -lt 1 ]]; then
+    daily done recap
+    return
+  fi
+
+  daily done add bullet "${*:2}" --tag "$1"
+  daily done recap
+}
+
+daily-todo() {
+  if [[ $# -lt 1 ]]; then
+    daily todo recap
+    return
+  fi
+
+  case $1 in "in-progress"|"done"|"forward"|"cancel"|"important")
+    daily todo mark $2 $1
+    ;;
+  *)
+    daily todo add checkbox $2 --tag $1
+    ;;
+  esac
+  daily todo recap
+}
