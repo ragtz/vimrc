@@ -6,8 +6,9 @@
 #   daily                             -> create/open today's note
 #   daily recap                       -> full note (numbered lists)
 #   daily <section> recap             -> one section (falls back to full note)
-#   daily <section> mark <i> <state>     state: in-progress|done|forward|cancel|important
-#   daily <section> add <checkbox|bullet> "text" [--tag <tag>]
+#   daily <section> mark <i> <state>     state: in-progress|done|check|forward|cancel|important|uncheck
+#   daily <section> add <checkbox|bullet> "text" [--tag <tag>] [--link <note>]
+#   daily <section> delete <i>
 #
 # <section> matches a heading (any level) by case-insensitive substring.
 # <i> is the list-item number as shown by recap (per-list, 1-based).
@@ -33,8 +34,9 @@ usage:
   daily
   daily recap
   daily <section> recap
-  daily <section> mark <index> <in-progress|done|forward|cancel|important>
-  daily <section> add <checkbox|bullet> "text" [--tag <tag>]
+  daily <section> mark <index> <in-progress|done|check|forward|cancel|important|uncheck>
+  daily <section> add <checkbox|bullet> "text" [--tag <tag>] [--link <note>]
+  daily <section> delete <index>
 EOF
 }
 
@@ -78,12 +80,13 @@ _daily_mark() {
 
     local mark
     case "$status" in
-        done)        mark='x' ;;
+        done|check)  mark='x' ;;
         in-progress) mark='/' ;;
         forward)     mark='>' ;;
         cancel)      mark='-' ;;
         important)   mark='!' ;;
-        *) echo "daily: state must be one of in-progress, done, forward, cancel, important" >&2; return 2 ;;
+        uncheck)     mark=' ' ;;
+        *) echo "daily: state must be one of in-progress, done, check, forward, cancel, important, uncheck" >&2; return 2 ;;
     esac
 
     local tmp; tmp="$(mktemp)"
@@ -125,24 +128,61 @@ _daily_mark() {
     esac
 }
 
+_daily_delete() {
+    local file="$1" section="$2" idx="$3"
+    if [ -z "$idx" ]; then _daily_usage; return 2; fi
+    case "$idx" in ''|*[!0-9]*) echo "daily: index must be a positive integer" >&2; return 2 ;; esac
+
+    local tmp; tmp="$(mktemp)"
+    WANT="$section" IDX="$idx" awk '
+        function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
+        BEGIN{ want=tolower(trim(ENVIRON["WANT"])); idx=ENVIRON["IDX"]+0
+               grab=0; level=0; n=0; found=0; deleted=0; done=0 }
+        /^#{1,6}[[:space:]]/{
+            match($0,/^#+/); h=RLENGTH; text=substr($0,h+1)
+            if(grab && h<=level) grab=0
+            if(!done && !grab && index(tolower(trim(text)),want)>0){ grab=1; found=1; level=h; n=0; print; next }
+            print; next
+        }
+        {
+            if(grab && !deleted){
+                if($0 ~ /^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]/){
+                    if(++n==idx){ deleted=1; done=1; next }
+                } else n=0
+            }
+            print
+        }
+        END{ if(!found) exit 3; if(!deleted) exit 4 }
+    ' "$file" > "$tmp"
+    local rc=$?
+    case "$rc" in
+        0) cat "$tmp" > "$file" && rm -f "$tmp" ;;
+        3) rm -f "$tmp"; echo "daily: no section matching '$section' found" >&2; return 3 ;;
+        4) rm -f "$tmp"; echo "daily: no list item #$idx under '$section'" >&2; return 4 ;;
+        *) rm -f "$tmp"; echo "daily: failed to process note" >&2; return 1 ;;
+    esac
+}
+
 _daily_add() {
     local file="$1" section="$2"; shift 2
     local type="$1"; shift
     case "$type" in checkbox|bullet) ;; *) echo "daily: add type must be 'checkbox' or 'bullet'" >&2; return 2 ;; esac
 
-    local text="" tag=""
+    local text="" tag="" link=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            --tag) tag="$2"; shift 2 ;;
+            --tag)  tag="$2";  shift 2 ;;
+            --link) link="$2"; shift 2 ;;
             *) text="${text:+$text }$1"; shift ;;
         esac
     done
     [ -n "$text" ] || { echo "daily: add requires text" >&2; return 2; }
 
-    local marker tagpart=""
+    local marker prefix=""
     case "$type" in checkbox) marker='- [ ]' ;; bullet) marker='-' ;; esac
-    [ -n "$tag" ] && tagpart="#${tag#\#} "
-    local content="$marker ${tagpart}$text"
+    if [ -n "$link" ]; then link="${link#\[\[}"; link="${link%\]\]}"; prefix="[[${link}]] "; fi
+    [ -n "$tag" ] && prefix="${prefix}#${tag#\#} "
+    local content="$marker ${prefix}$text"
 
     local tmp; tmp="$(mktemp)"
     WANT="$section" ADD="$content" awk '
@@ -192,10 +232,29 @@ daily() {
 
     case "$verb" in
         recap) _daily_recap "$file" "$section" ;;
-        mark)  _daily_mark  "$file" "$section" "$@" ;;
-        add)   _daily_add   "$file" "$section" "$@" ;;
+        mark)   _daily_mark   "$file" "$section" "$@" ;;
+        add)    _daily_add    "$file" "$section" "$@" ;;
+        delete) _daily_delete "$file" "$section" "$@" ;;
         *) echo "daily: unknown verb '$verb'" >&2; _daily_usage; return 2 ;;
     esac
+}
+
+# Split wrapper args into note text and an optional wiki-link, using a bare
+# `@` sigil: everything after the first `@`-token runs to end-of-line as the
+# link (spaces allowed, no quotes); text is everything before it. Sets _TEXT
+# and _LINK in the caller's scope. `@Foo Bar` and `@ Foo Bar` both work.
+_daily_split() {
+  _TEXT=""; _LINK=""
+  local in_link=0 w
+  for w in "$@"; do
+    if [ "$in_link" -eq 0 ] && [ "${w#@}" != "$w" ]; then
+      in_link=1; _LINK="${w#@}"
+    elif [ "$in_link" -eq 1 ]; then
+      _LINK="${_LINK:+$_LINK }$w"
+    else
+      _TEXT="${_TEXT:+$_TEXT }$w"
+    fi
+  done
 }
 
 daily-done() {
@@ -204,7 +263,15 @@ daily-done() {
     return
   fi
 
-  daily done add bullet "${*:2}" --tag "$1"
+  local _TEXT _LINK
+  # <verb> <i>: first arg is a verb only when the second arg is a number.
+  if [[ $1 == del && $2 =~ ^[0-9]+$ ]]; then
+    daily done delete "$2"
+  else
+    _daily_split "$@"
+    daily done add bullet "$_TEXT" ${_LINK:+--link "$_LINK"}
+  fi
+
   daily done recap
 }
 
@@ -214,12 +281,21 @@ daily-todo() {
     return
   fi
 
-  case $1 in "in-progress"|"done"|"forward"|"cancel"|"important")
-    daily todo mark $2 $1
-    ;;
-  *)
-    daily todo add checkbox $2 --tag $1
-    ;;
+  local _TEXT _LINK verb=""
+  # <verb> <i>: first arg is a verb only when the second arg is a number.
+  if [[ $2 =~ ^[0-9]+$ ]]; then
+    case $1 in
+      del)                                               verb=del ;;
+      done|check|in-progress|forward|cancel|important|uncheck) verb=mark ;;
+    esac
+  fi
+
+  case $verb in
+    del)  daily todo delete "$2" ;;
+    mark) daily todo mark "$2" "$1" ;;
+    *)    _daily_split "$@"
+          daily todo add checkbox "$_TEXT" ${_LINK:+--link "$_LINK"} ;;
   esac
+
   daily todo recap
 }
