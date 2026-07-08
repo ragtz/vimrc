@@ -257,9 +257,21 @@ _daily_split() {
   done
 }
 
+# Render a recap through mdviewer. mdviewer natively rewrites [[wiki-links]]
+# to markdown links, but for multi-word names it emits an unescaped space in
+# the URL (e.g. [Manip Retool](./Manip Retool.md)), which CommonMark rejects,
+# so the link shows as literal text. Pre-convert the wiki-links ourselves into
+# a link with an angle-bracket URL, which mdviewer renders correctly.
+_daily_view() {
+  sed -E \
+    -e 's#\[\[([^]|]+)\|([^]]+)\]\]#[\2](<./\1.md>)#g' \
+    -e 's#\[\[([^]]+)\]\]#[\1](<./\1.md>)#g' \
+  | mdviewer
+}
+
 daily-done() {
   if [[ $# -lt 1 ]]; then
-    daily done recap
+    daily done recap | _daily_view
     return
   fi
 
@@ -272,12 +284,12 @@ daily-done() {
     daily done add bullet "$_TEXT" ${_LINK:+--link "$_LINK"}
   fi
 
-  daily done recap
+  daily done recap | _daily_view
 }
 
 daily-todo() {
   if [[ $# -lt 1 ]]; then
-    daily todo recap
+    daily todo recap | _daily_view
     return
   fi
 
@@ -297,5 +309,5 @@ daily-todo() {
           daily todo add checkbox "$_TEXT" ${_LINK:+--link "$_LINK"} ;;
   esac
 
-  daily todo recap
+  daily todo recap | _daily_view
 }
