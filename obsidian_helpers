@@ -260,12 +260,13 @@ _daily_split() {
 # Render a recap through mdviewer. mdviewer natively rewrites [[wiki-links]]
 # to markdown links, but for multi-word names it emits an unescaped space in
 # the URL (e.g. [Manip Retool](./Manip Retool.md)), which CommonMark rejects,
-# so the link shows as literal text. Pre-convert the wiki-links ourselves into
-# a link with an angle-bracket URL, which mdviewer renders correctly.
+# so the link shows as literal text. Pre-convert the wiki-links ourselves to a
+# link with a "#" target: mdviewer keeps the link styling on the name but shows
+# no ".md" URL. (Delimiter is ~ since the replacement contains #.)
 _daily_view() {
   sed -E \
-    -e 's#\[\[([^]|]+)\|([^]]+)\]\]#[\2](<./\1.md>)#g' \
-    -e 's#\[\[([^]]+)\]\]#[\1](<./\1.md>)#g' \
+    -e 's~\[\[([^]|]+)\|([^]]+)\]\]~[\2](#)~g' \
+    -e 's~\[\[([^]]+)\]\]~[\1](#)~g' \
   | mdviewer
 }
 
