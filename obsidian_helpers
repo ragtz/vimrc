@@ -6,12 +6,12 @@
 #   daily                             -> create/open today's note
 #   daily recap                       -> full note (numbered lists)
 #   daily <section> recap             -> one section (falls back to full note)
-#   daily <section> mark <i> <state>     state: in-progress|done|check|forward|cancel|important|uncheck
+#   daily <section> mark <i...> <state>  state: in-progress|done|check|forward|cancel|important|uncheck
 #   daily <section> add <checkbox|bullet> "text" [--tag <tag>] [--link <note>]
-#   daily <section> delete <i>
+#   daily <section> delete <i...>
 #
 # <section> matches a heading (any level) by case-insensitive substring.
-# <i> is the list-item number as shown by recap (per-list, 1-based).
+# <i...> are one or more list-item numbers as shown by recap (per-list, 1-based).
 # Checkbox glyphs follow Obsidian's convention:
 #   done -> [x]  in-progress -> [/]  forward -> [>]  cancel -> [-]  important -> [!]
 # Override the target file with $DAILY_NOTE.
@@ -34,9 +34,9 @@ usage:
   daily
   daily recap
   daily <section> recap
-  daily <section> mark <index> <in-progress|done|check|forward|cancel|important|uncheck>
+  daily <section> mark <index...> <in-progress|done|check|forward|cancel|important|uncheck>
   daily <section> add <checkbox|bullet> "text" [--tag <tag>] [--link <note>]
-  daily <section> delete <index>
+  daily <section> delete <index...>
 EOF
 }
 
@@ -74,9 +74,15 @@ _daily_recap() {
 }
 
 _daily_mark() {
-    local file="$1" section="$2" idx="$3" status="$4"
-    if [ -z "$idx" ] || [ -z "$status" ]; then _daily_usage; return 2; fi
-    case "$idx" in ''|*[!0-9]*) echo "daily: index must be a positive integer" >&2; return 2 ;; esac
+    local file="$1" section="$2"; shift 2
+    # trailing arg is the target state; every arg before it is a list index
+    if [ "$#" -lt 2 ]; then _daily_usage; return 2; fi
+    local status="${@: -1}"
+    local idxs=( "${@:1:$#-1}" )
+    local i
+    for i in "${idxs[@]}"; do
+        case "$i" in ''|*[!0-9]*) echo "daily: index must be a positive integer" >&2; return 2 ;; esac
+    done
 
     local mark
     case "$status" in
@@ -90,20 +96,21 @@ _daily_mark() {
     esac
 
     local tmp; tmp="$(mktemp)"
-    WANT="$section" IDX="$idx" MARK="$mark" awk '
+    WANT="$section" IDXS="${idxs[*]}" MARK="$mark" awk '
         function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
-        BEGIN{ want=tolower(trim(ENVIRON["WANT"])); idx=ENVIRON["IDX"]+0; mark=ENVIRON["MARK"]
-               grab=0; level=0; n=0; found=0; marked=0; done=0 }
+        BEGIN{ want=tolower(trim(ENVIRON["WANT"])); mark=ENVIRON["MARK"]
+               ni=split(ENVIRON["IDXS"], a, " "); for(i=1;i<=ni;i++) target[a[i]+0]=1
+               grab=0; entered=0; level=0; n=0; found=0; marked=0 }
         /^#{1,6}[[:space:]]/{
             match($0,/^#+/); h=RLENGTH; text=substr($0,h+1)
             if(grab && h<=level) grab=0
-            if(!done && !grab && index(tolower(trim(text)),want)>0){ grab=1; found=1; level=h; n=0; print; next }
+            if(!entered && !grab && index(tolower(trim(text)),want)>0){ grab=1; entered=1; found=1; level=h; n=0 }
             print; next
         }
         {
-            if(grab && !marked){
+            if(grab){
                 if($0 ~ /^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]/){
-                    if(++n==idx){
+                    if(++n in target){
                         line=$0
                         if(line ~ /^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]+\[.\]/)
                             sub(/\[.\]/, "[" mark "]", line)
@@ -111,7 +118,7 @@ _daily_mark() {
                             sub(/^[[:space:]]*[-*+][[:space:]]+/, "&[" mark "] ", line)
                         else
                             sub(/^[[:space:]]*[0-9]+[.)][[:space:]]+/, "&[" mark "] ", line)
-                        print line; marked=1; done=1; next
+                        print line; marked++; next
                     }
                 } else n=0
             }
@@ -123,31 +130,37 @@ _daily_mark() {
     case "$rc" in
         0) cat "$tmp" > "$file" && rm -f "$tmp" ;;
         3) rm -f "$tmp"; echo "daily: no section matching '$section' found" >&2; return 3 ;;
-        4) rm -f "$tmp"; echo "daily: no list item #$idx under '$section'" >&2; return 4 ;;
+        4) rm -f "$tmp"; echo "daily: no list items (${idxs[*]}) under '$section'" >&2; return 4 ;;
         *) rm -f "$tmp"; echo "daily: failed to process note" >&2; return 1 ;;
     esac
 }
 
 _daily_delete() {
-    local file="$1" section="$2" idx="$3"
-    if [ -z "$idx" ]; then _daily_usage; return 2; fi
-    case "$idx" in ''|*[!0-9]*) echo "daily: index must be a positive integer" >&2; return 2 ;; esac
+    local file="$1" section="$2"; shift 2
+    if [ "$#" -lt 1 ]; then _daily_usage; return 2; fi
+    local i
+    for i in "$@"; do
+        case "$i" in ''|*[!0-9]*) echo "daily: index must be a positive integer" >&2; return 2 ;; esac
+    done
 
+    # Number list items by their original position and drop the targeted ones in
+    # a single pass, so deleting several at once doesn't shift indices mid-run.
     local tmp; tmp="$(mktemp)"
-    WANT="$section" IDX="$idx" awk '
+    WANT="$section" IDXS="$*" awk '
         function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
-        BEGIN{ want=tolower(trim(ENVIRON["WANT"])); idx=ENVIRON["IDX"]+0
-               grab=0; level=0; n=0; found=0; deleted=0; done=0 }
+        BEGIN{ want=tolower(trim(ENVIRON["WANT"]))
+               ni=split(ENVIRON["IDXS"], a, " "); for(i=1;i<=ni;i++) target[a[i]+0]=1
+               grab=0; entered=0; level=0; n=0; found=0; deleted=0 }
         /^#{1,6}[[:space:]]/{
             match($0,/^#+/); h=RLENGTH; text=substr($0,h+1)
             if(grab && h<=level) grab=0
-            if(!done && !grab && index(tolower(trim(text)),want)>0){ grab=1; found=1; level=h; n=0; print; next }
+            if(!entered && !grab && index(tolower(trim(text)),want)>0){ grab=1; entered=1; found=1; level=h; n=0 }
             print; next
         }
         {
-            if(grab && !deleted){
+            if(grab){
                 if($0 ~ /^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]/){
-                    if(++n==idx){ deleted=1; done=1; next }
+                    if(++n in target){ deleted++; next }
                 } else n=0
             }
             print
@@ -158,7 +171,7 @@ _daily_delete() {
     case "$rc" in
         0) cat "$tmp" > "$file" && rm -f "$tmp" ;;
         3) rm -f "$tmp"; echo "daily: no section matching '$section' found" >&2; return 3 ;;
-        4) rm -f "$tmp"; echo "daily: no list item #$idx under '$section'" >&2; return 4 ;;
+        4) rm -f "$tmp"; echo "daily: no list items ($*) under '$section'" >&2; return 4 ;;
         *) rm -f "$tmp"; echo "daily: failed to process note" >&2; return 1 ;;
     esac
 }
@@ -263,8 +276,16 @@ _daily_split() {
 # so the link shows as literal text. Pre-convert the wiki-links ourselves to a
 # link with a "#" target: mdviewer keeps the link styling on the name but shows
 # no ".md" URL. (Delimiter is ~ since the replacement contains #.)
+#
+# The recap numbers checkbox items as "  N. [ ] text". mdviewer treats a
+# leading [ ]/[x] as a GFM task-list item and renders a checkbox glyph in
+# place of the ordinal N, so the number vanishes for unchecked/done items
+# (the Obsidian-only states [/] [>] [-] [!] aren't task syntax, so they keep
+# their number). Escape the checkbox bracket so mdviewer leaves it as literal
+# text and always shows the ordinal.
 _daily_view() {
   sed -E \
+    -e 's~^([[:space:]]*[0-9]+\.[[:space:]]+)\[(.)\]~\1\\[\2\\]~' \
     -e 's~\[\[([^]|]+)\|([^]]+)\]\]~[\2](#)~g' \
     -e 's~\[\[([^]]+)\]\]~[\1](#)~g' \
   | mdviewer
@@ -277,9 +298,10 @@ daily-done() {
   fi
 
   local _TEXT _LINK
-  # <verb> <i>: first arg is a verb only when the second arg is a number.
+  # <verb> <i...>: first arg is a verb only when the second arg is a number
+  # (the remaining args are treated as additional indices).
   if [[ $1 == del && $2 =~ ^[0-9]+$ ]]; then
-    daily done delete "$2"
+    daily done delete "${@:2}"
   else
     _daily_split "$@"
     daily done add bullet "$_TEXT" ${_LINK:+--link "$_LINK"}
@@ -295,7 +317,8 @@ daily-todo() {
   fi
 
   local _TEXT _LINK verb=""
-  # <verb> <i>: first arg is a verb only when the second arg is a number.
+  # <verb> <i...>: first arg is a verb only when the second arg is a number
+  # (the remaining args are treated as additional indices).
   if [[ $2 =~ ^[0-9]+$ ]]; then
     case $1 in
       del)                                               verb=del ;;
@@ -304,8 +327,8 @@ daily-todo() {
   fi
 
   case $verb in
-    del)  daily todo delete "$2" ;;
-    mark) daily todo mark "$2" "$1" ;;
+    del)  daily todo delete "${@:2}" ;;
+    mark) daily todo mark "${@:2}" "$1" ;;
     *)    _daily_split "$@"
           daily todo add checkbox "$_TEXT" ${_LINK:+--link "$_LINK"} ;;
   esac
