@@ -28,6 +28,85 @@ _daily_file() {
     printf '%s\n' "$file"
 }
 
+_daily_ensure_file() {
+    if [ -n "$DAILY_NOTE" ]; then printf '%s\n' "$DAILY_NOTE"; return 0; fi
+    local vault rel file
+    vault="$(obsidian vault 2>/dev/null | awk -F'\t' '$1=="path"{print $2}')"
+    rel="$(obsidian daily:path 2>/dev/null)"
+    [ -n "$vault" ] && [ -n "$rel" ] || { echo "daily: could not resolve daily note path" >&2; return 1; }
+    file="$vault/$rel"
+    if [ ! -f "$file" ]; then
+        obsidian daily >/dev/null 2>&1        # Obsidian creates (and opens) today's note
+        local i=0
+        while [ ! -f "$file" ] && [ "$i" -lt 20 ]; do sleep 0.1; i=$((i+1)); done
+    fi
+    [ -f "$file" ] || { echo "daily: could not create daily note at $file" >&2; return 1; }
+    printf '%s\n' "$file"
+}
+
+# Resolve a daily note by day offset (0=today, -1=yesterday, ...), read-only.
+# Offset 0 delegates to _daily_file (honors $DAILY_NOTE); past notes are located
+# by date and never created. Assumes YYYY-MM-DD.md daily-note filenames.
+_daily_file_offset() {
+    local off="$1"
+    if [ "$off" -eq 0 ]; then _daily_file; return; fi
+    local vault rel dir base today date file
+    vault="$(obsidian vault 2>/dev/null | awk -F'\t' '$1=="path"{print $2}')"
+    rel="$(obsidian daily:path 2>/dev/null)"
+    [ -n "$vault" ] && [ -n "$rel" ] || { echo "daily: could not resolve daily note path" >&2; return 1; }
+    dir="$(dirname "$rel")"; base="$(basename "$rel" .md)"
+    today="$(date +%F)"
+    [ "$base" = "$today" ] || { echo "daily: daily-note name '$base' is not YYYY-MM-DD; offset lookups unsupported" >&2; return 1; }
+    date="$(date -d "$off day" +%F)" || return 1
+    if [ "$dir" = "." ]; then file="$vault/$date.md"; else file="$vault/$dir/$date.md"; fi
+    [ -f "$file" ] || { echo "daily: no daily note for $date at $file" >&2; return 1; }
+    printf '%s\n' "$file"
+}
+
+# Insert a "## <heading>" line if the section is absent, keeping the managed
+# sections in canonical order (todo -> done -> notes) regardless of the order
+# the daily-* commands run. A new heading goes immediately before the first
+# existing section that outranks it; with no higher-ranked section it is
+# appended at end. Rank comes from the heading text via the same case-insensitive
+# substring rule the verbs use, so "## Done" still matches the `done` verb.
+_daily_ensure_section() {
+    local file="$1" heading="$2"
+    local tmp; tmp="$(mktemp)"
+    HEADING="$heading" awk '
+        function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
+        function hrank(t,  lt){ lt=tolower(trim(t))
+            if(index(lt,"todo")>0)  return 1
+            if(index(lt,"done")>0)  return 2
+            if(index(lt,"notes")>0) return 3
+            return 0 }
+        BEGIN{ heading=ENVIRON["HEADING"]; rank=hrank(heading) }
+        { lines[NR]=$0 }
+        /^#{1,6}[[:space:]]/{
+            match($0,/^#+/)
+            if(hrank(substr($0,RLENGTH+1))==rank) exists=1
+        }
+        END{
+            if(exists){ for(i=1;i<=NR;i++) print lines[i]; exit }
+            for(i=1;i<=NR;i++){
+                if(!inserted && lines[i] ~ /^#{1,6}[[:space:]]/){
+                    match(lines[i],/^#+/)
+                    if(hrank(substr(lines[i],RLENGTH+1))>rank){
+                        if(i>1 && lines[i-1] !~ /^[[:space:]]*$/) print ""
+                        print "## " heading; print ""
+                        inserted=1
+                    }
+                }
+                print lines[i]
+            }
+            if(!inserted){
+                if(NR>0 && lines[NR] !~ /^[[:space:]]*$/) print ""
+                print "## " heading
+            }
+        }
+    ' "$file" > "$tmp"
+    cat "$tmp" > "$file" && rm -f "$tmp"
+}
+
 _daily_usage() {
     cat >&2 <<'EOF'
 usage:
@@ -292,46 +371,100 @@ _daily_view() {
 }
 
 daily-done() {
-  if [[ $# -lt 1 ]]; then
-    daily done recap | _daily_view
-    return
-  fi
+  local file; file="$(_daily_ensure_file)" || return 1
+  _daily_ensure_section "$file" Done
 
-  local _TEXT _LINK
-  # <verb> <i...>: first arg is a verb only when the second arg is a number
-  # (the remaining args are treated as additional indices).
-  if [[ $1 == del && $2 =~ ^[0-9]+$ ]]; then
-    daily done delete "${@:2}"
-  else
-    _daily_split "$@"
-    daily done add bullet "$_TEXT" ${_LINK:+--link "$_LINK"}
+  if [[ $# -ge 1 ]]; then
+    local _TEXT _LINK
+    # <verb> <i...>: first arg is a verb only when the second arg is a number
+    # (the remaining args are treated as additional indices).
+    if [[ $1 == del && $2 =~ ^[0-9]+$ ]]; then
+      daily done delete "${@:2}"
+    else
+      _daily_split "$@"
+      daily done add bullet "$_TEXT" ${_LINK:+--link "$_LINK"}
+    fi
   fi
 
   daily done recap | _daily_view
 }
 
-daily-todo() {
-  if [[ $# -lt 1 ]]; then
-    daily todo recap | _daily_view
-    return
+daily-note() {
+  local file; file="$(_daily_ensure_file)" || return 1
+  _daily_ensure_section "$file" Notes
+
+  if [[ $# -ge 1 ]]; then
+    local _TEXT _LINK
+    # <verb> <i...>: first arg is a verb only when the second arg is a number
+    # (the remaining args are treated as additional indices).
+    if [[ $1 == del && $2 =~ ^[0-9]+$ ]]; then
+      daily notes delete "${@:2}"
+    else
+      _daily_split "$@"
+      daily notes add bullet "$_TEXT" ${_LINK:+--link "$_LINK"}
+    fi
   fi
 
-  local _TEXT _LINK verb=""
-  # <verb> <i...>: first arg is a verb only when the second arg is a number
-  # (the remaining args are treated as additional indices).
-  if [[ $2 =~ ^[0-9]+$ ]]; then
-    case $1 in
-      del)                                               verb=del ;;
-      done|check|in-progress|forward|cancel|important|uncheck) verb=mark ;;
+  daily notes recap | _daily_view
+}
+
+daily-todo() {
+  local file; file="$(_daily_ensure_file)" || return 1
+  _daily_ensure_section "$file" Todo
+
+  if [[ $# -ge 1 ]]; then
+    local _TEXT _LINK verb=""
+    # <verb> <i...>: first arg is a verb only when the second arg is a number
+    # (the remaining args are treated as additional indices).
+    if [[ $2 =~ ^[0-9]+$ ]]; then
+      case $1 in
+        del)                                               verb=del ;;
+        done|check|in-progress|forward|cancel|important|uncheck) verb=mark ;;
+      esac
+    fi
+
+    case $verb in
+      del)  daily todo delete "${@:2}" ;;
+      mark) daily todo mark "${@:2}" "$1" ;;
+      *)    _daily_split "$@"
+            daily todo add checkbox "$_TEXT" ${_LINK:+--link "$_LINK"} ;;
     esac
   fi
 
-  case $verb in
-    del)  daily todo delete "${@:2}" ;;
-    mark) daily todo mark "${@:2}" "$1" ;;
-    *)    _daily_split "$@"
-          daily todo add checkbox "$_TEXT" ${_LINK:+--link "$_LINK"} ;;
+  daily todo recap | _daily_view
+}
+
+# daily-recap [<offset>|yester|ere]
+#   no arg / 0 / today   -> today's note
+#   -N                   -> N days ago (-1 = yesterday, -2 = the day before, ...)
+#   yester | yesterday   -> -1
+#   ere | ereyesterday   -> -2
+daily-recap() {
+  local off
+  case "${1-}" in
+    ''|0|today)        off=0 ;;
+    yester|yesterday)  off=-1 ;;
+    ere|ereyesterday)  off=-2 ;;
+    *) if [[ $1 =~ ^-[0-9]+$ ]]; then off=$1
+       else echo "daily-recap: expected a negative day offset (e.g. -1), or yester/ere" >&2; return 2; fi ;;
   esac
 
-  daily todo recap | _daily_view
+  local file; file="$(_daily_file_offset "$off")" || return 1
+  _daily_recap "$file" "" | _daily_view
+}
+
+dtodo() {
+  daily-todo $@
+}
+
+ddone() {
+  daily-done $@
+}
+
+dnote() {
+  daily-note $@
+}
+
+drecap() {
+  daily-recap $@
 }
