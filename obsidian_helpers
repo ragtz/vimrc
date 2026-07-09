@@ -7,11 +7,14 @@
 #   daily recap                       -> full note (numbered lists)
 #   daily <section> recap             -> one section (falls back to full note)
 #   daily <section> mark <i...> <state>  state: in-progress|done|check|forward|cancel|important|uncheck
-#   daily <section> add <checkbox|bullet> "text" [--tag <tag>] [--link <note>]
+#   daily <section> add <checkbox|bullet> "text" [--tag <tag>] [--link <note>] [--under <i>]
 #   daily <section> delete <i...>
 #
 # <section> matches a heading (any level) by case-insensitive substring.
 # <i...> are one or more list-item numbers as shown by recap (per-list, 1-based).
+# --under <i> nests the new item beneath list item <i> (the dnote/dtodo/ddone
+# wrappers expose this as `sub <i> "text"`). delete removes an item's whole
+# subtree; mark affects only the targeted line, not its nested children.
 # Checkbox glyphs follow Obsidian's convention:
 #   done -> [x]  in-progress -> [/]  forward -> [>]  cancel -> [-]  important -> [!]
 # Override the target file with $DAILY_NOTE.
@@ -114,14 +117,15 @@ usage:
   daily recap
   daily <section> recap
   daily <section> mark <index...> <in-progress|done|check|forward|cancel|important|uncheck>
-  daily <section> add <checkbox|bullet> "text" [--tag <tag>] [--link <note>]
+  daily <section> add <checkbox|bullet> "text" [--tag <tag>] [--link <note>] [--under <index>]
   daily <section> delete <index...>
 EOF
 }
 
 _daily_recap() {
-    local file="$1" section="$2" note out result
+    local file="$1" section="$2" note out result nbsp
     note="$(cat "$file")" || return 1
+    nbsp=$(printf '\xc2\xa0')   # UTF-8 non-breaking space (see nesting note below)
 
     result="$note"
     if [ -n "$section" ]; then
@@ -139,13 +143,44 @@ _daily_recap() {
     fi
 
     if printf '%s\n' "$result" | grep -qE '^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]'; then
-        printf '%s\n' "$result" | awk '
+        # Number list items with a single flat counter (the "line-number" used by
+        # mark/delete), keeping the counter's reset-on-non-list-line rule so the
+        # displayed numbers match what those verbs count. Nesting is preserved by
+        # re-applying each item's original leading whitespace to the text; the
+        # numbers themselves stay flush-left, left-justified in a column wide
+        # enough for the largest index so the text lines up.
+        #
+        # The nesting indent is emitted as non-breaking spaces, not ASCII spaces.
+        # In a terminal they look identical, but when the wrappers pipe recap
+        # through mdviewer (a markdown renderer) ordinary leading spaces get
+        # swallowed as list-item indentation and the nesting is lost; nbsp is
+        # treated as literal content, so `N. ` still reads as an ordered-list
+        # marker while the indentation survives.
+        printf '%s\n' "$result" | NBSP="$nbsp" awk '
+            { lines[NR] = $0 }
             /^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]/ {
-                line = $0
-                sub(/^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]+/, "", line)
-                printf "  %d. %s\n", ++n, line; next
+                num[NR] = ++n
+                if (n > maxn) maxn = n
+                match($0, /^[[:space:]]*/); ws[NR] = substr($0, 1, RLENGTH)
+                line = substr($0, RLENGTH + 1)              # strip leading ws, keep marker + text
+                if (line ~ /^[-*+][[:space:]]+\[.\]/)        # checkbox: drop bullet so [ ] stays escapable
+                    sub(/^[-*+][[:space:]]+/, "", line)
+                else if (line ~ /^[0-9]+[.)][[:space:]]/)    # source ordered list: drop marker (we renumber)
+                    sub(/^[0-9]+[.)][[:space:]]+/, "", line)
+                # else plain bullet: keep the marker verbatim
+                content[NR] = line
+                next
             }
-            { n = 0; print }
+            { n = 0 }
+            END {
+                nbsp = ENVIRON["NBSP"]
+                width = length(maxn "") + 1   # +1 for the trailing "."
+                for (i = 1; i <= NR; i++) {
+                    if (num[i]) { wsn = ws[i]; gsub(/ /, nbsp, wsn)
+                                  printf "%-*s %s%s\n", width, num[i] ".", wsn, content[i] }
+                    else        print lines[i]
+                }
+            }
         '
     else
         printf '%s\n' "$result"
@@ -224,23 +259,29 @@ _daily_delete() {
 
     # Number list items by their original position and drop the targeted ones in
     # a single pass, so deleting several at once doesn't shift indices mid-run.
+    # Deleting an item also drops its subtree: every following list item indented
+    # deeper than it, until a sibling/ancestor or a non-list line. Descendants
+    # still advance the counter so the remaining indices stay aligned with recap.
     local tmp; tmp="$(mktemp)"
     WANT="$section" IDXS="$*" awk '
         function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
         BEGIN{ want=tolower(trim(ENVIRON["WANT"]))
                ni=split(ENVIRON["IDXS"], a, " "); for(i=1;i<=ni;i++) target[a[i]+0]=1
-               grab=0; entered=0; level=0; n=0; found=0; deleted=0 }
+               grab=0; entered=0; level=0; n=0; found=0; deleted=0; submode=0; dw=0 }
         /^#{1,6}[[:space:]]/{
             match($0,/^#+/); h=RLENGTH; text=substr($0,h+1)
-            if(grab && h<=level) grab=0
-            if(!entered && !grab && index(tolower(trim(text)),want)>0){ grab=1; entered=1; found=1; level=h; n=0 }
+            if(grab && h<=level){ grab=0; submode=0 }
+            if(!entered && !grab && index(tolower(trim(text)),want)>0){ grab=1; entered=1; found=1; level=h; n=0; submode=0 }
             print; next
         }
         {
             if(grab){
                 if($0 ~ /^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]/){
-                    if(++n in target){ deleted++; next }
-                } else n=0
+                    match($0,/^[[:space:]]*/); w=RLENGTH
+                    if(submode && w>dw){ ++n; deleted++; next }   # descendant of a deleted item
+                    submode=0                                      # w<=dw ends the subtree
+                    if(++n in target){ dw=w; submode=1; deleted++; next }
+                } else { submode=0; n=0 }
             }
             print
         }
@@ -260,15 +301,19 @@ _daily_add() {
     local type="$1"; shift
     case "$type" in checkbox|bullet) ;; *) echo "daily: add type must be 'checkbox' or 'bullet'" >&2; return 2 ;; esac
 
-    local text="" tag="" link=""
+    local text="" tag="" link="" under=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            --tag)  tag="$2";  shift 2 ;;
-            --link) link="$2"; shift 2 ;;
+            --tag)   tag="$2";   shift 2 ;;
+            --link)  link="$2";  shift 2 ;;
+            --under) under="$2"; shift 2 ;;
             *) text="${text:+$text }$1"; shift ;;
         esac
     done
     [ -n "$text" ] || { echo "daily: add requires text" >&2; return 2; }
+    if [ -n "$under" ]; then
+        case "$under" in ''|*[!0-9]*) echo "daily: --under index must be a positive integer" >&2; return 2 ;; esac
+    fi
 
     local marker prefix=""
     case "$type" in checkbox) marker='- [ ]' ;; bullet) marker='-' ;; esac
@@ -277,30 +322,70 @@ _daily_add() {
     local content="$marker ${prefix}$text"
 
     local tmp; tmp="$(mktemp)"
-    WANT="$section" ADD="$content" awk '
-        function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
-        function flush(){ print ENVIRON["ADD"]; for(i=1;i<=np;i++) print pend[i]; np=0; grab=0 }
-        BEGIN{ want=tolower(trim(ENVIRON["WANT"])); grab=0; done=0; level=0; np=0; found=0 }
-        /^#{1,6}[[:space:]]/{
-            match($0,/^#+/); h=RLENGTH; text=substr($0,h+1)
-            if(grab && h<=level) flush()
-            if(!done && !grab && index(tolower(trim(text)),want)>0){ grab=1; found=1; level=h; print; next }
-            print; next
-        }
-        {
-            if(grab){
-                if($0 ~ /^[[:space:]]*$/){ pend[++np]=$0; next }
-                for(i=1;i<=np;i++) print pend[i]; np=0; print; next
+    if [ -n "$under" ]; then
+        # Nest the new item under list item <under> (the line-number recap shows).
+        # Insert it immediately after that item's subtree, indented one step
+        # deeper than the parent. The item counter uses the same reset-on-non-
+        # list-line rule as recap/mark so <under> lines up with what recap prints.
+        WANT="$section" ADD="$content" UNDER="$under" STEP='    ' awk '
+            function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
+            function emit(){ printf "%s%s%s\n", parentws, ENVIRON["STEP"], ENVIRON["ADD"]; inserted=1; submode=0 }
+            BEGIN{ want=tolower(trim(ENVIRON["WANT"])); under=ENVIRON["UNDER"]+0
+                   grab=0; level=0; found=0; n=0; submode=0; inserted=0; pw=0 }
+            /^#{1,6}[[:space:]]/{
+                match($0,/^#+/); h=RLENGTH; t=substr($0,h+1)
+                if(grab && h<=level){ if(submode && !inserted) emit(); grab=0 }
+                if(!grab && index(tolower(trim(t)),want)>0){ grab=1; found=1; level=h; n=0 }
+                print; next
             }
-            print
-        }
-        END{ if(grab) flush(); if(!found) exit 3 }
-    ' "$file" > "$tmp"
-    local rc=$?
-    if [ "$rc" -eq 3 ]; then
-        printf '\n## %s\n%s\n' "$section" "$content" >> "$tmp"
-    elif [ "$rc" -ne 0 ]; then
-        rm -f "$tmp"; echo "daily: failed to process note" >&2; return 1
+            {
+                if(grab && !inserted){
+                    if($0 ~ /^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]/){
+                        match($0,/^[[:space:]]*/); w=RLENGTH
+                        if(submode && w<=pw) emit()
+                        if(!inserted && ++n==under){ pw=w; parentws=substr($0,1,w); submode=1 }
+                    } else {
+                        if(submode) emit(); n=0
+                    }
+                }
+                print
+            }
+            END{ if(grab && submode && !inserted) emit()
+                 if(!found) exit 3; if(!inserted) exit 5 }
+        ' "$file" > "$tmp"
+        local rc=$?
+        case "$rc" in
+            0) : ;;
+            3) rm -f "$tmp"; echo "daily: no section matching '$section' found" >&2; return 3 ;;
+            5) rm -f "$tmp"; echo "daily: no list item $under under '$section'" >&2; return 4 ;;
+            *) rm -f "$tmp"; echo "daily: failed to process note" >&2; return 1 ;;
+        esac
+    else
+        WANT="$section" ADD="$content" awk '
+            function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
+            function flush(){ print ENVIRON["ADD"]; for(i=1;i<=np;i++) print pend[i]; np=0; grab=0 }
+            BEGIN{ want=tolower(trim(ENVIRON["WANT"])); grab=0; done=0; level=0; np=0; found=0 }
+            /^#{1,6}[[:space:]]/{
+                match($0,/^#+/); h=RLENGTH; text=substr($0,h+1)
+                if(grab && h<=level) flush()
+                if(!done && !grab && index(tolower(trim(text)),want)>0){ grab=1; found=1; level=h; print; next }
+                print; next
+            }
+            {
+                if(grab){
+                    if($0 ~ /^[[:space:]]*$/){ pend[++np]=$0; next }
+                    for(i=1;i<=np;i++) print pend[i]; np=0; print; next
+                }
+                print
+            }
+            END{ if(grab) flush(); if(!found) exit 3 }
+        ' "$file" > "$tmp"
+        local rc=$?
+        if [ "$rc" -eq 3 ]; then
+            printf '\n## %s\n%s\n' "$section" "$content" >> "$tmp"
+        elif [ "$rc" -ne 0 ]; then
+            rm -f "$tmp"; echo "daily: failed to process note" >&2; return 1
+        fi
     fi
     cat "$tmp" > "$file" && rm -f "$tmp"
 }
@@ -362,9 +447,17 @@ _daily_split() {
 # (the Obsidian-only states [/] [>] [-] [!] aren't task syntax, so they keep
 # their number). Escape the checkbox bracket so mdviewer leaves it as literal
 # text and always shows the ordinal.
+#
+# Recap also keeps the bullet marker on plain bullets ("N. - text"). A marker
+# sitting right after the ordinal makes mdviewer parse it as a nested sublist and
+# break the bullet onto its own line, so escape that marker too and it renders
+# inline as a literal "-". Nested bullets are indented with non-breaking spaces
+# (which [[:space:]] doesn't match), so they already render literally and are
+# left alone.
 _daily_view() {
   sed -E \
     -e 's~^([[:space:]]*[0-9]+\.[[:space:]]+)\[(.)\]~\1\\[\2\\]~' \
+    -e 's~^([[:space:]]*[0-9]+\.[[:space:]]+)([-*+])([[:space:]])~\1\\\2\3~' \
     -e 's~\[\[([^]|]+)\|([^]]+)\]\]~[\2](#)~g' \
     -e 's~\[\[([^]]+)\]\]~[\1](#)~g' \
   | mdviewer
@@ -380,6 +473,9 @@ daily-done() {
     # (the remaining args are treated as additional indices).
     if [[ $1 == del && $2 =~ ^[0-9]+$ ]]; then
       daily done delete "${@:2}"
+    elif [[ $1 == sub && $2 =~ ^[0-9]+$ ]]; then
+      _daily_split "${@:3}"
+      daily done add bullet "$_TEXT" --under "$2" ${_LINK:+--link "$_LINK"}
     else
       _daily_split "$@"
       daily done add bullet "$_TEXT" ${_LINK:+--link "$_LINK"}
@@ -399,6 +495,9 @@ daily-note() {
     # (the remaining args are treated as additional indices).
     if [[ $1 == del && $2 =~ ^[0-9]+$ ]]; then
       daily notes delete "${@:2}"
+    elif [[ $1 == sub && $2 =~ ^[0-9]+$ ]]; then
+      _daily_split "${@:3}"
+      daily notes add bullet "$_TEXT" --under "$2" ${_LINK:+--link "$_LINK"}
     else
       _daily_split "$@"
       daily notes add bullet "$_TEXT" ${_LINK:+--link "$_LINK"}
@@ -419,6 +518,7 @@ daily-todo() {
     if [[ $2 =~ ^[0-9]+$ ]]; then
       case $1 in
         del)                                               verb=del ;;
+        sub)                                               verb=sub ;;
         done|check|in-progress|forward|cancel|important|uncheck) verb=mark ;;
       esac
     fi
@@ -426,6 +526,8 @@ daily-todo() {
     case $verb in
       del)  daily todo delete "${@:2}" ;;
       mark) daily todo mark "${@:2}" "$1" ;;
+      sub)  _daily_split "${@:3}"
+            daily todo add checkbox "$_TEXT" --under "$2" ${_LINK:+--link "$_LINK"} ;;
       *)    _daily_split "$@"
             daily todo add checkbox "$_TEXT" ${_LINK:+--link "$_LINK"} ;;
     esac
