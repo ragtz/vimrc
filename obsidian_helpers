@@ -123,9 +123,8 @@ EOF
 }
 
 _daily_recap() {
-    local file="$1" section="$2" note out result nbsp
+    local file="$1" section="$2" note out result
     note="$(cat "$file")" || return 1
-    nbsp=$(printf '\xc2\xa0')   # UTF-8 non-breaking space (see nesting note below)
 
     result="$note"
     if [ -n "$section" ]; then
@@ -145,25 +144,23 @@ _daily_recap() {
     if printf '%s\n' "$result" | grep -qE '^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]'; then
         # Number list items with a single flat counter (the "line-number" used by
         # mark/delete), keeping the counter's reset-on-non-list-line rule so the
-        # displayed numbers match what those verbs count. Nesting is preserved by
-        # re-applying each item's original leading whitespace to the text; the
-        # numbers themselves stay flush-left, left-justified in a column wide
-        # enough for the largest index so the text lines up.
+        # displayed numbers match what those verbs count.
         #
-        # The nesting indent is emitted as non-breaking spaces, not ASCII spaces.
-        # In a terminal they look identical, but when the wrappers pipe recap
-        # through mdviewer (a markdown renderer) ordinary leading spaces get
-        # swallowed as list-item indentation and the nesting is lost; nbsp is
-        # treated as literal content, so `N. ` still reads as an ordered-list
-        # marker while the indentation survives.
-        printf '%s\n' "$result" | NBSP="$nbsp" awk '
+        # The number is rendered as a right-aligned gutter -- "  N | text" -- so it
+        # reads as a line-number column rather than an ordered list. The item keeps
+        # its marker (bullet "-" or checkbox "[ ]"; see the marker rules below) and
+        # its nesting is shown by re-applying the original leading whitespace as
+        # ordinary spaces. When the wrappers pipe recap through mdviewer, _daily_view
+        # wraps these gutter lines in a code block, so the spacing and alignment
+        # survive verbatim (monospace).
+        printf '%s\n' "$result" | awk '
             { lines[NR] = $0 }
             /^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]/ {
                 num[NR] = ++n
                 if (n > maxn) maxn = n
                 match($0, /^[[:space:]]*/); ws[NR] = substr($0, 1, RLENGTH)
                 line = substr($0, RLENGTH + 1)              # strip leading ws, keep marker + text
-                if (line ~ /^[-*+][[:space:]]+\[.\]/)        # checkbox: drop bullet so [ ] stays escapable
+                if (line ~ /^[-*+][[:space:]]+\[.\]/)        # checkbox: drop bullet, keep [ ]
                     sub(/^[-*+][[:space:]]+/, "", line)
                 else if (line ~ /^[0-9]+[.)][[:space:]]/)    # source ordered list: drop marker (we renumber)
                     sub(/^[0-9]+[.)][[:space:]]+/, "", line)
@@ -173,11 +170,9 @@ _daily_recap() {
             }
             { n = 0 }
             END {
-                nbsp = ENVIRON["NBSP"]
-                width = length(maxn "") + 1   # +1 for the trailing "."
+                width = length(maxn "")   # widest index, no trailing "."
                 for (i = 1; i <= NR; i++) {
-                    if (num[i]) { wsn = ws[i]; gsub(/ /, nbsp, wsn)
-                                  printf "%-*s %s%s\n", width, num[i] ".", wsn, content[i] }
+                    if (num[i]) printf "%*d │ %s%s\n", width, num[i], ws[i], content[i]
                     else        print lines[i]
                 }
             }
@@ -434,32 +429,48 @@ _daily_split() {
   done
 }
 
-# Render a recap through mdviewer. mdviewer natively rewrites [[wiki-links]]
-# to markdown links, but for multi-word names it emits an unescaped space in
-# the URL (e.g. [Manip Retool](./Manip Retool.md)), which CommonMark rejects,
-# so the link shows as literal text. Pre-convert the wiki-links ourselves to a
-# link with a "#" target: mdviewer keeps the link styling on the name but shows
-# no ".md" URL. (Delimiter is ~ since the replacement contains #.)
+# Render a recap through mdviewer. The recap emits each list item as a right-
+# aligned gutter line ("  N | text"). A bare gutter isn't a markdown list, so
+# mdviewer would join consecutive lines into one paragraph; instead we wrap each
+# contiguous run of gutter lines in a fenced code block, which preserves the
+# column alignment, the "-"/"[ ]" markers and the leading-space nesting verbatim,
+# and reads as a monospace line-number gutter. Section headers and blank lines
+# fall outside the fences and still render as styled markdown. Content (including
+# [[wiki-links]]) is shown literally inside the code block.
 #
-# The recap numbers checkbox items as "  N. [ ] text". mdviewer treats a
-# leading [ ]/[x] as a GFM task-list item and renders a checkbox glyph in
-# place of the ordinal N, so the number vanishes for unchecked/done items
-# (the Obsidian-only states [/] [>] [-] [!] aren't task syntax, so they keep
-# their number). Escape the checkbox bracket so mdviewer leaves it as literal
-# text and always shows the ordinal.
+# The fence is tagged "text" so mdviewer treats it as plain preformatted text.
+# An untagged fence makes mdviewer guess a language and syntax-highlight the
+# content (odd colors on links, brackets, punctuation); "text" disables that.
 #
-# Recap also keeps the bullet marker on plain bullets ("N. - text"). A marker
-# sitting right after the ordinal makes mdviewer parse it as a nested sublist and
-# break the bullet onto its own line, so escape that marker too and it renders
-# inline as a literal "-". Nested bullets are indented with non-breaking spaces
-# (which [[:space:]] doesn't match), so they already render literally and are
-# left alone.
+# Gutter lines longer than the terminal width are word-wrapped here, with a
+# hanging indent so continuations align under the item's content instead of
+# dangling at column 0. We wrap to W-6 (mdviewer wraps code content only past
+# W-5 and adds a 4-col margin), so mdviewer leaves our lines untouched and the
+# indent survives. Continuation lines are emitted inside the fence by wrap().
 _daily_view() {
-  sed -E \
-    -e 's~^([[:space:]]*[0-9]+\.[[:space:]]+)\[(.)\]~\1\\[\2\\]~' \
-    -e 's~^([[:space:]]*[0-9]+\.[[:space:]]+)([-*+])([[:space:]])~\1\\\2\3~' \
-    -e 's~\[\[([^]|]+)\|([^]]+)\]\]~[\2](#)~g' \
-    -e 's~\[\[([^]]+)\]\]~[\1](#)~g' \
+  local cols; cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
+  awk -v W="$cols" '
+      function wrap(line,   p,rest,nlen,hlen,lead,hang,body,n,words,i,cur){
+          if (length(line) <= T) { print line; return }
+          match(line, /^ *[0-9]+ │ /); p = RLENGTH          # gutter prefix "…N | "
+          rest = substr(line, p+1); match(rest, /^ */); nlen = RLENGTH   # nesting
+          hlen = p + nlen
+          lead = substr(line, 1, hlen)          # prefix + nesting (first line)
+          hang = sprintf("%*s", hlen, "")       # blank gutter for continuations
+          body = substr(line, hlen+1)           # content words
+          n = split(body, words, " ")
+          cur = lead words[1]
+          for (i = 2; i <= n; i++) {
+              if (length(cur) + 1 + length(words[i]) > T) { print cur; cur = hang words[i] }
+              else cur = cur " " words[i]
+          }
+          print cur
+      }
+      BEGIN { infence = 0; T = (W > 12 ? W - 6 : 200) }
+      /^ *[0-9]+ │ / { if (!infence) { print "```text"; infence = 1 } wrap($0); next }
+      { if (infence) { print "```"; infence = 0 } print }
+      END { if (infence) print "```" }
+    ' \
   | mdviewer
 }
 
