@@ -450,12 +450,16 @@ _daily_split() {
 _daily_view() {
   local cols; cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
   awk -v W="$cols" '
-      function wrap(line,   p,rest,nlen,hlen,lead,hang,body,n,words,i,cur){
+      function wrap(line,   p,rest,nlen,mark,mlen,hlen,lead,hang,body,n,words,i,cur){
           if (length(line) <= T) { print line; return }
           match(line, /^ *[0-9]+ │ /); p = RLENGTH          # gutter prefix "…N | "
           rest = substr(line, p+1); match(rest, /^ */); nlen = RLENGTH   # nesting
-          hlen = p + nlen
-          lead = substr(line, 1, hlen)          # prefix + nesting (first line)
+          mark = substr(rest, nlen+1)           # marker + text
+          if (mark ~ /^- /) mlen = 2            # bullet: align continuation under text
+          else if (mark ~ /^\[.\] /) mlen = 4   # checkbox "[ ] "
+          else mlen = 0
+          hlen = p + nlen + mlen
+          lead = substr(line, 1, hlen)          # prefix + nesting + marker (first line)
           hang = sprintf("%*s", hlen, "")       # blank gutter for continuations
           body = substr(line, hlen+1)           # content words
           n = split(body, words, " ")
