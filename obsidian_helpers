@@ -586,9 +586,13 @@ drecap() {
   daily-recap $@
 }
 
-wsum() {
+wrecap() {
+  local weeks="${1:-1}"
+  case "$weeks" in ''|*[!0-9]*) echo "wsum: weeks must be a positive integer" >&2; return 2 ;; esac
+  [ "$weeks" -ge 1 ] || { echo "wsum: weeks must be >= 1" >&2; return 2; }
+
   cd notes
-  example="
+  local example="
 📋 Weekly Update — Jul 6–10
 
 🤖 Manip Retool / Dual Device Elevator (main focus)
@@ -621,7 +625,18 @@ TL;DR — Week of Jul 6–10
 • Onboarded Mihir (env + robot access; FetchCore still blocked)
 • Reviews (symbolic BT, contact monitor, visual servo), pager duty assist on moxi62, misc bugfixes
   "
-  prompt="provide a summary of the work done this week, formatted as a slack status update. include a tldr at the end with a bulleted list. Follow a format similar to the following: ${example}"
+  local period title_note
+  if [ "$weeks" -eq 1 ]; then
+    period="this week"; title_note=""
+  else
+    period="the past ${weeks} weeks"
+    title_note=" Title the update \"📋 Update — <date range>\" (do NOT include the word \"Weekly\" in the title, since this covers multiple weeks)."
+  fi
+  local prompt="provide a summary of the work done ${period}, formatted as a single slack status update with one TL;DR at the end as a bulleted list. If it spans multiple weeks, use a header date range covering the whole period and combine everything into one update (do not produce separate per-week sections).${title_note} Follow a format similar to the following: ${example}"
   claude -p "${prompt}"
   cd - > /dev/null 2>&1
+}
+
+srecap() {
+  wrecap 3
 }
