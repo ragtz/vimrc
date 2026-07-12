@@ -585,3 +585,43 @@ dnote() {
 drecap() {
   daily-recap $@
 }
+
+wsum() {
+  cd notes
+  example="
+📋 Weekly Update — Jul 6–10
+
+🤖 Manip Retool / Dual Device Elevator (main focus)
+• Ported align-EEF planner from Python → manip exec v2, wired into the DDE elevator planner
+• Fixed DDE badge/thumb transform bug that made planning always fail
+• Built a benchmarking pipeline (fleet runs vs. DDE pipeline); it surfaced + I fixed a reverse-planner joint-normalization bug
+• Hit param/behavior parity for press-elevator-button planner — ~2.3x faster planning with minimal accuracy trade-off
+• Merged scan + move-to-pre-press stages for DDE high
+• Shipped ~9 MRs: get_bag metadata flag, footprint ng server, DDE support + sensitivity inpress-elevator-button, DDE result variants (badge scan + button press), stage-failure reporting, keyboard-gamepad timestamp fix
+
+👀 Reviews
+• Symbolic BT playback (2 passes), task-bounds contl-servo port, manip_coord split MR
+
+🧑💻 Onboarding (Mihir)
+• Set up env + access: SSH/robot, Claude, robot test container, Robodash, mdocker, DroneDeploy, Multibot, OnDemand, SemanticUI,
+ChatGPT
+• ⚠️ FetchCore still blocked
+
+🛠️ Other
+• Pager duty: helped Jess resolve moxi62 HAC failuroolset
+• Fixed ctrl+c bug in keyboard gamepad script
+
+🔜 Carrying over
+• Optional moxi_manipulation_data in wall_manipulatr DDE testing)
+• Finish Mihir's FetchCore onboarding
+
+TL;DR — Week of Jul 6–10
+• Drove DDE elevator planning forward: ported align-EEF planner to manip exec v2, fixed the transform + reverse-planner bugs, hit parity with ~2.3x faster planning (~9 MRs shipped)
+• Built a benchmarking pipeline (fleet vs. DDE) that caught the reverse-planner bug
+• Onboarded Mihir (env + robot access; FetchCore still blocked)
+• Reviews (symbolic BT, contact monitor, visual servo), pager duty assist on moxi62, misc bugfixes
+  "
+  prompt="provide a summary of the work done this week, formatted as a slack status update. include a tldr at the end with a bulleted list. Follow a format similar to the following: ${example}"
+  claude -p "${prompt}"
+  cd - > /dev/null 2>&1
+}
