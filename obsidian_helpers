@@ -570,6 +570,167 @@ daily-recap() {
   _daily_recap "$file" "" | _daily_view
 }
 
+# Find the most recent prior daily note by scanning back from today (handles
+# weekends/gaps). Reuses _daily_file_offset, which is read-only and errors when a
+# given day has no note; we swallow those and return the first day that resolves.
+_mvtodo_prev_file() {
+  local off f
+  for off in $(seq 1 60); do
+    f="$(_daily_file_offset "-$off" 2>/dev/null)" && { printf '%s\n' "$f"; return 0; }
+  done
+  echo "mvtodo: no prior daily note found in the last 60 days" >&2
+  return 1
+}
+
+# Pull carry-over todos out of the source note's Todo section and, in the same
+# pass, mark those items forwarded in the source. A "carry item" is a checkbox
+# whose glyph is open ([ ]), in-progress ([/]) or important ([!]); done ([x]),
+# cancel ([-]) and already-forwarded ([>]) are skipped. Nesting is preserved: a
+# carried item drags its whole subtree (deeper-indented list lines) verbatim,
+# using the same submode/indent rule as _daily_delete. Carried lines are written
+# verbatim (original glyph) to $3 (the extract file); to the source (stdout) every
+# carried carry-glyph line is rewritten [.] -> [>] (at any depth, so a re-run
+# finds nothing to carry -- idempotent), while carried done/cancel descendants
+# keep their state. The rewritten source is committed back only if anything was
+# extracted, so a no-op run leaves the source untouched.
+_mvtodo_extract() {
+  local file="$1" section="$2" extract="$3"
+  : > "$extract"
+  local tmp; tmp="$(mktemp)"
+  WANT="$section" EXTRACT="$extract" awk '
+    function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
+    function carryglyph(line,   g){
+        if(match(line,/^[[:space:]]*[-*+][[:space:]]+\[.\]/)){
+            g=substr(line,RLENGTH-1,1); return (g==" "||g=="/"||g=="!") }
+        return 0 }
+    BEGIN{ want=tolower(trim(ENVIRON["WANT"])); ex=ENVIRON["EXTRACT"]
+           grab=0; entered=0; level=0; kb=-1 }
+    /^#{1,6}[[:space:]]/{
+        match($0,/^#+/); h=RLENGTH; text=substr($0,h+1)
+        if(grab && h<=level){ grab=0; kb=-1 }
+        if(!entered && !grab && index(tolower(trim(text)),want)>0){ grab=1; entered=1; level=h; kb=-1 }
+        print; next
+    }
+    {
+        if(grab && $0 ~ /^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]/){
+            match($0,/^[[:space:]]*/); w=RLENGTH
+            carried=0
+            if(kb>=0 && w>kb) carried=1                       # descendant of a carried item
+            else { kb=-1; if(carryglyph($0)){ carried=1; kb=w } }  # w<=kb ends the subtree
+            if(carried){
+                print $0 > ex                                 # extract: verbatim, original glyph
+                line=$0
+                if(carryglyph($0)) sub(/\[.\]/,"[>]",line)    # source: mark forwarded
+                print line; next
+            }
+            print; next
+        }
+        if(grab) kb=-1                                        # non-list line ends the subtree
+        print
+    }
+  ' "$file" > "$tmp"
+  [ -s "$extract" ] && cat "$tmp" > "$file"
+  rm -f "$tmp"
+}
+
+# Drop lines from the extract file (arg 2) whose checkbox text already exists in
+# today's Todo section (arg 1), printing the surviving block to stdout. Compares
+# the trimmed text after the checkbox glyph; non-checkbox lines always pass.
+_mvtodo_filter_dupes() {
+  local today="$1" extract="$2"
+  T="$today" awk '
+    function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
+    function ckey(line,   s){
+        if(match(line,/^[[:space:]]*[-*+][[:space:]]+\[.\][[:space:]]*/)){
+            s=substr(line,RLENGTH+1); return trim(s) }
+        return "" }
+    BEGIN{ tf=ENVIRON["T"]; grab=0; level=0 }
+    FILENAME==tf {
+        if($0 ~ /^#{1,6}[[:space:]]/){
+            match($0,/^#+/); h=RLENGTH; text=substr($0,h+1)
+            if(grab && h<=level) grab=0
+            if(!grab && index(tolower(trim(text)),"todo")>0){ grab=1; level=h }
+            next
+        }
+        if(grab){ k=ckey($0); if(k!="") seen[k]=1 }
+        next
+    }
+    { k=ckey($0); if(k!="" && (k in seen)) next; print }
+  ' "$today" "$extract"
+}
+
+# Append the block file (arg 3) verbatim at the end of today's Todo section,
+# using _daily_add's non---under append idiom: buffer trailing blank lines and
+# dump the block before them at the section boundary / EOF. _daily_ensure_section
+# guarantees the heading exists, so a missing section is an internal error.
+_mvtodo_insert() {
+  local file="$1" section="$2" block="$3"
+  local tmp; tmp="$(mktemp)"
+  WANT="$section" BLOCK="$block" awk '
+    function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
+    function flush(  l){ while((getline l < ENVIRON["BLOCK"])>0) print l
+                         for(i=1;i<=np;i++) print pend[i]; np=0; grab=0 }
+    BEGIN{ want=tolower(trim(ENVIRON["WANT"])); grab=0; level=0; np=0; found=0 }
+    /^#{1,6}[[:space:]]/{
+        match($0,/^#+/); h=RLENGTH; text=substr($0,h+1)
+        if(grab && h<=level) flush()
+        if(!found && !grab && index(tolower(trim(text)),want)>0){ grab=1; found=1; level=h; print; next }
+        print; next
+    }
+    {
+        if(grab){
+            if($0 ~ /^[[:space:]]*$/){ pend[++np]=$0; next }
+            for(i=1;i<=np;i++) print pend[i]; np=0; print; next
+        }
+        print
+    }
+    END{ if(grab) flush(); if(!found) exit 3 }
+  ' "$file" > "$tmp"
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then rm -f "$tmp"; echo "mvtodo: no Todo section in today's note" >&2; return 1; fi
+  cat "$tmp" > "$file" && rm -f "$tmp"
+}
+
+# mvtodo [<offset>|yester|ere]
+#   Copy unfinished todos ([ ], [/], [!]) from the most recent prior daily note
+#   into today's Todo section, preserving nesting and each item's glyph, and mark
+#   the originals forwarded ([>]) in that prior note. Duplicates already present in
+#   today's Todo are skipped; re-running carries nothing (idempotent).
+#   With an arg, force the source day instead of scanning back: yester (-1),
+#   ere (-2), or an explicit negative offset like -3.
+mvtodo() {
+  local today; today="$(_daily_ensure_file)" || return 1
+  _daily_ensure_section "$today" Todo
+
+  local src
+  if [ "$#" -ge 1 ]; then
+    local off
+    case "$1" in
+      yester|yesterday) off=-1 ;;
+      ere|ereyesterday) off=-2 ;;
+      *) if [[ $1 =~ ^-[0-9]+$ ]]; then off=$1
+         else echo "mvtodo: expected a negative day offset (e.g. -1), or yester/ere" >&2; return 2; fi ;;
+    esac
+    src="$(_daily_file_offset "$off")" || return 1
+  else
+    src="$(_mvtodo_prev_file)" || return 1
+  fi
+
+  local extract block
+  extract="$(mktemp)"; block="$(mktemp)"
+  _mvtodo_extract "$src" Todo "$extract"
+
+  if [ ! -s "$extract" ]; then
+    echo "mvtodo: no unfinished todos in $src to carry over" >&2
+  else
+    _mvtodo_filter_dupes "$today" "$extract" > "$block"
+    [ -s "$block" ] && _mvtodo_insert "$today" Todo "$block"
+  fi
+  rm -f "$extract" "$block"
+
+  daily todo recap | _daily_view
+}
+
 dtodo() {
   daily-todo $@
 }
