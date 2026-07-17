@@ -808,11 +808,29 @@ drecap() {
 }
 
 wrecap() {
-  local weeks="${1:-1}"
+  local weeks="" slack=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --slack) slack=1; shift ;;
+      *)       weeks="$1"; shift ;;
+    esac
+  done
+  weeks="${weeks:-1}"
   case "$weeks" in ''|*[!0-9]*) echo "wrecap: weeks must be a positive integer" >&2; return 2 ;; esac
   [ "$weeks" -ge 1 ] || { echo "wrecap: weeks must be >= 1" >&2; return 2; }
 
   cd notes
+
+  local period title_note
+  if [ "$weeks" -eq 1 ]; then
+    period="this week"; title_note=""
+  else
+    period="the past ${weeks} weeks"
+    title_note=" Title the update \"📋 Update — <date range>\" (do NOT include the word \"Weekly\" in the title, since this covers multiple weeks)."
+  fi
+
+  local prompt
+  if [ "$slack" -eq 1 ]; then
   local example="
 📋 Weekly Update — Jul 6–10
 
@@ -846,18 +864,43 @@ TL;DR — Week of Jul 6–10
 • Onboarded Mihir (env + robot access; FetchCore still blocked)
 • Reviews (symbolic BT, contact monitor, visual servo), pager duty assist on moxi62, misc bugfixes
   "
-  local period title_note
-  if [ "$weeks" -eq 1 ]; then
-    period="this week"; title_note=""
+    prompt="provide a summary of the work done ${period}, formatted as a single slack status update with one TL;DR at the end as a bulleted list. If it spans multiple weeks, use a header date range covering the whole period and combine everything into one update (do not produce separate per-week sections).${title_note} Follow a format similar to the following: ${example}"
   else
-    period="the past ${weeks} weeks"
-    title_note=" Title the update \"📋 Update — <date range>\" (do NOT include the word \"Weekly\" in the title, since this covers multiple weeks)."
+    local template="
+[Headline] (1–2 sentences)
+The most important thing your manager should take away from this week. This will be used by the CEO/COO when scanning Tier 1s on Sunday.
+
+Wins / Highlights
+Bullet format. Tag each: [LIGHTS] / [XLT] / [FYI]. Be specific. Leave out minor bugfixes and information regarding number of passes. Bias answers towards FYI
+• [FYI]: Regular update, state progress. 
+• [XLT]: An update you think should bubble up to Diligent exec leadership 
+• [LIGHTS]: An Update you think should bubble up to Serve leadership (parent company)
+
+Risks / Lowlights
+Same bullet/tag format. If a risk has materialized, say what you are doing about it and by when.
+• [Tag] [Client/Project]: Risk, current mitigation, escalation status.
+
+Asks
+Use the four-element format. Tag with [Blocker] / [Decision] / [Help] / [FYI Ask].
+• [Tag] Context. Owner: [name]. Ask: [specific request]. Deadline: [date].
+• Tags: [Blocker] = stops work; [Decision] = need a decision to be made; [Help] = bandwidth or expertise needed.
+
+Looking Ahead (next week)
+• Material upcoming events: expected progress, deadlines.
+
+Function-specific detail
+Operational section:
+• Sprint : The above update is for which sprint
+• Releases: The work mentioned above will go in which release. Can be N/A
+• Incidents: If there are any specific PD incidents to call out
+• Misc
+    "
+    prompt="Provide a summary of the work done ${period}, formattd to fit this template: ${template}."
   fi
-  local prompt="provide a summary of the work done ${period}, formatted as a single slack status update with one TL;DR at the end as a bulleted list. If it spans multiple weeks, use a header date range covering the whole period and combine everything into one update (do not produce separate per-week sections).${title_note} Follow a format similar to the following: ${example}"
   claude -p "${prompt}"
   cd - > /dev/null 2>&1
 }
 
 srecap() {
-  wrecap 3
+  wrecap "$@" 3
 }
