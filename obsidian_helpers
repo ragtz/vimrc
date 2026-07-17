@@ -20,6 +20,56 @@
 # Override the target file with $DAILY_NOTE.
 # ---------------------------------------------------------------------------
 
+# Sprint tracking: sprints are 21 days, continuous (each starts the day after the
+# previous ends, no gaps). New daily notes get a `sprint: [[Sprint <N>]]` YAML
+# frontmatter property computed from this anchor. To re-anchor, set ANCHOR_DATE to
+# the day a known sprint starts and ANCHOR_NUM to that sprint's number.
+_DAILY_SPRINT_ANCHOR_DATE=2026-07-06
+_DAILY_SPRINT_ANCHOR_NUM=169
+_DAILY_SPRINT_DAYS=21
+
+# Sprint number for a YYYY-MM-DD date: anchor + floor(days since anchor / length).
+# Endpoints are compared at noon so a DST shift can't move the day count.
+_daily_sprint_num() {
+    local date="$1" a d delta cycles
+    a="$(date -d "$_DAILY_SPRINT_ANCHOR_DATE 12:00" +%s)" || return 1
+    d="$(date -d "$date 12:00" +%s)" || return 1
+    delta=$(( (d - a) / 86400 ))
+    if [ "$delta" -ge 0 ]; then
+        cycles=$(( delta / _DAILY_SPRINT_DAYS ))
+    else
+        # floor toward negative infinity for dates before the anchor
+        cycles=$(( (delta - (_DAILY_SPRINT_DAYS - 1)) / _DAILY_SPRINT_DAYS ))
+    fi
+    printf '%s\n' "$(( _DAILY_SPRINT_ANCHOR_NUM + cycles ))"
+}
+
+# Insert a `--- sprint: [[Sprint <N>]] ---` frontmatter block at the top of the
+# note if it doesn't already carry a sprint property. Idempotent: a leading `---`
+# fence or a bare `sprint:` first line (older un-fenced notes) both count as
+# already-tagged. The sprint number is derived from the YYYY-MM-DD filename, or
+# today's date if the name isn't a date (e.g. a $DAILY_NOTE override).
+_daily_ensure_sprint() {
+    local file="$1" date num tmp
+    date="$(basename "$file" .md)"
+    case "$date" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+        *) date="$(date +%F)" ;;
+    esac
+    local first; IFS= read -r first < "$file"
+    case "$first" in
+        ---|sprint:*) return 0 ;;
+    esac
+    num="$(_daily_sprint_num "$date")" || return 1
+    tmp="$(mktemp)"
+    {
+        printf -- '---\nsprint: [[Sprint %s]]\n---\n\n' "$num"
+        # skip any leading blank lines so the spacing stays clean
+        awk 'seen || NF { seen=1; print }' "$file"
+    } > "$tmp"
+    cat "$tmp" > "$file" && rm -f "$tmp"
+}
+
 _daily_file() {
     if [ -n "$DAILY_NOTE" ]; then printf '%s\n' "$DAILY_NOTE"; return 0; fi
     local vault rel file
@@ -32,18 +82,22 @@ _daily_file() {
 }
 
 _daily_ensure_file() {
-    if [ -n "$DAILY_NOTE" ]; then printf '%s\n' "$DAILY_NOTE"; return 0; fi
     local vault rel file
-    vault="$(obsidian vault 2>/dev/null | awk -F'\t' '$1=="path"{print $2}')"
-    rel="$(obsidian daily:path 2>/dev/null)"
-    [ -n "$vault" ] && [ -n "$rel" ] || { echo "daily: could not resolve daily note path" >&2; return 1; }
-    file="$vault/$rel"
-    if [ ! -f "$file" ]; then
-        obsidian daily >/dev/null 2>&1        # Obsidian creates (and opens) today's note
-        local i=0
-        while [ ! -f "$file" ] && [ "$i" -lt 20 ]; do sleep 0.1; i=$((i+1)); done
+    if [ -n "$DAILY_NOTE" ]; then
+        file="$DAILY_NOTE"
+    else
+        vault="$(obsidian vault 2>/dev/null | awk -F'\t' '$1=="path"{print $2}')"
+        rel="$(obsidian daily:path 2>/dev/null)"
+        [ -n "$vault" ] && [ -n "$rel" ] || { echo "daily: could not resolve daily note path" >&2; return 1; }
+        file="$vault/$rel"
+        if [ ! -f "$file" ]; then
+            obsidian daily >/dev/null 2>&1        # Obsidian creates (and opens) today's note
+            local i=0
+            while [ ! -f "$file" ] && [ "$i" -lt 20 ]; do sleep 0.1; i=$((i+1)); done
+        fi
+        [ -f "$file" ] || { echo "daily: could not create daily note at $file" >&2; return 1; }
     fi
-    [ -f "$file" ] || { echo "daily: could not create daily note at $file" >&2; return 1; }
+    [ -f "$file" ] && _daily_ensure_sprint "$file"
     printf '%s\n' "$file"
 }
 
@@ -388,7 +442,8 @@ _daily_add() {
 daily() {
     # bare `daily` -> create/open today's daily note
     if [ "$#" -eq 0 ]; then
-        obsidian daily
+        _daily_ensure_file >/dev/null || return 1   # create + add sprint property
+        obsidian daily                              # open/focus the note
         return
     fi
 
