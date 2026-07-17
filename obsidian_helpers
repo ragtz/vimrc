@@ -525,7 +525,19 @@ _daily_view() {
           }
           print cur
       }
-      BEGIN { infence = 0; T = (W > 12 ? W - 6 : 200) }
+      function esc(s){ gsub(/\[/, "\\[", s); gsub(/\]/, "\\]", s); return s }
+      BEGIN { infence = 0; fm = 0; T = (W > 12 ? W - 6 : 200) }
+      # Leading YAML frontmatter: keep the --- delimiters (mdviewer draws a divider)
+      # but backslash-escape the [ ] in each property so mdviewer shows the
+      # [[wikilink]] literally (e.g. sprint: [[Sprint 169]]) instead of expanding
+      # it to a linked-doc path.
+      # fm: 0 = preamble, 1 = inside a --- block, 2 = past the frontmatter.
+      fm == 0 && /^[[:space:]]*$/ { print; next }                 # pass leading blanks
+      fm == 0 && /^---[[:space:]]*$/ { print; fm = 1; next }       # open block, keep ---
+      fm == 0 && /^[[:space:]]*sprint:/ { print esc($0); fm = 2; next }  # legacy un-fenced note
+      fm == 0 { fm = 2 }                                          # first body line, no frontmatter
+      fm == 1 && /^---[[:space:]]*$/ { print; fm = 2; next }       # close block, keep ---
+      fm == 1 { print esc($0); next }                            # escape property line
       /^ *[0-9]+ │ / { if (!infence) { print "```text"; infence = 1 } wrap($0); next }
       { if (infence) { print "```"; infence = 0 } print }
       END { if (infence) print "```" }
