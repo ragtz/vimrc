@@ -556,6 +556,8 @@ daily-todo() {
 #   -N                   -> N days ago (-1 = yesterday, -2 = the day before, ...)
 #   yester | yesterday   -> -1
 #   ere | ereyesterday   -> -2
+# Recapping today creates the note (with empty Todo/Done sections) if it doesn't
+# exist yet; past days are read-only and error when absent.
 daily-recap() {
   local off
   case "${1-}" in
@@ -566,7 +568,14 @@ daily-recap() {
        else echo "daily-recap: expected a negative day offset (e.g. -1), or yester/ere" >&2; return 2; fi ;;
   esac
 
-  local file; file="$(_daily_file_offset "$off")" || return 1
+  local file
+  if [ "$off" -eq 0 ]; then
+    file="$(_daily_ensure_file)" || return 1
+    _daily_ensure_section "$file" Todo
+    _daily_ensure_section "$file" Done
+  else
+    file="$(_daily_file_offset "$off")" || return 1
+  fi
   _daily_recap "$file" "" | _daily_view
 }
 
@@ -585,13 +594,20 @@ _mvtodo_prev_file() {
 # Pull carry-over todos out of the source note's Todo section and, in the same
 # pass, mark those items forwarded in the source. A "carry item" is a checkbox
 # whose glyph is open ([ ]), in-progress ([/]) or important ([!]); done ([x]),
-# cancel ([-]) and already-forwarded ([>]) are skipped. Nesting is preserved: a
-# carried item drags its whole subtree (deeper-indented list lines) verbatim,
-# using the same submode/indent rule as _daily_delete. Carried lines are written
-# verbatim (original glyph) to $3 (the extract file); to the source (stdout) every
-# carried carry-glyph line is rewritten [.] -> [>] (at any depth, so a re-run
-# finds nothing to carry -- idempotent), while carried done/cancel descendants
-# keep their state. The rewritten source is committed back only if anything was
+# cancel ([-]) and already-forwarded ([>]) are skipped. We carry the *full stack*
+# around every carry item: the item itself, its whole subtree (deeper-indented
+# list lines), AND its ancestor chain -- so an open child under a completed
+# parent brings its parent(s) along for context instead of landing as an
+# orphaned indent. A line is carried iff it is a carry item, a descendant of one,
+# or an ancestor of one. Because "is this marked parent an ancestor of a carry
+# item?" depends on a child seen later, the file is buffered and the carried set
+# is computed with an indent stack before emitting.
+#
+# Carried lines are written verbatim (original glyph) to $3 (the extract file),
+# so marked ancestors arrive on the new note still marked and open items arrive
+# still open. To the source (stdout) every carried carry-glyph line is rewritten
+# [.] -> [>] (marked ancestors keep their glyph, so a re-run finds no carry items
+# -- idempotent). The rewritten source is committed back only if anything was
 # extracted, so a no-op run leaves the source untouched.
 _mvtodo_extract() {
   local file="$1" section="$2" extract="$3"
@@ -603,30 +619,44 @@ _mvtodo_extract() {
         if(match(line,/^[[:space:]]*[-*+][[:space:]]+\[.\]/)){
             g=substr(line,RLENGTH-1,1); return (g==" "||g=="/"||g=="!") }
         return 0 }
-    BEGIN{ want=tolower(trim(ENVIRON["WANT"])); ex=ENVIRON["EXTRACT"]
-           grab=0; entered=0; level=0; kb=-1 }
-    /^#{1,6}[[:space:]]/{
-        match($0,/^#+/); h=RLENGTH; text=substr($0,h+1)
-        if(grab && h<=level){ grab=0; kb=-1 }
-        if(!entered && !grab && index(tolower(trim(text)),want)>0){ grab=1; entered=1; level=h; kb=-1 }
-        print; next
-    }
-    {
-        if(grab && $0 ~ /^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]/){
-            match($0,/^[[:space:]]*/); w=RLENGTH
-            carried=0
-            if(kb>=0 && w>kb) carried=1                       # descendant of a carried item
-            else { kb=-1; if(carryglyph($0)){ carried=1; kb=w } }  # w<=kb ends the subtree
-            if(carried){
-                print $0 > ex                                 # extract: verbatim, original glyph
-                line=$0
-                if(carryglyph($0)) sub(/\[.\]/,"[>]",line)    # source: mark forwarded
-                print line; next
+    BEGIN{ want=tolower(trim(ENVIRON["WANT"])); ex=ENVIRON["EXTRACT"] }
+    { line[NR]=$0 }
+    END{
+        # Pass 1: locate the Todo section and flag every carried line.
+        grab=0; entered=0; level=0; sp=0; carryDepth=0
+        for(r=1;r<=NR;r++){
+            s=line[r]
+            if(s ~ /^#{1,6}[[:space:]]/){
+                match(s,/^#+/); h=RLENGTH; text=substr(s,h+1)
+                if(grab && h<=level){ grab=0; sp=0; carryDepth=0 }
+                if(!entered && !grab && index(tolower(trim(text)),want)>0){
+                    grab=1; entered=1; level=h; sp=0; carryDepth=0 }
+                continue
             }
-            print; next
+            if(!grab) continue
+            if(s ~ /^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]/){
+                match(s,/^[[:space:]]*/); w=RLENGTH
+                while(sp>0 && stackw[sp]>=w){ if(stackc[sp]) carryDepth--; sp-- }
+                isc=carryglyph(s)
+                if(isc){                                       # carry item + its ancestors
+                    carried[r]=1
+                    for(k=1;k<=sp;k++) carried[stacki[k]]=1
+                }
+                if(carryDepth>0) carried[r]=1                  # descendant of a carry item
+                sp++; stacki[sp]=r; stackw[sp]=w; stackc[sp]=isc
+                if(isc) carryDepth++
+            } else { sp=0; carryDepth=0 }                      # non-list line ends subtrees
         }
-        if(grab) kb=-1                                        # non-list line ends the subtree
-        print
+        # Pass 2: emit. Carried lines go to the extract verbatim; the source copy
+        # forwards carry-glyph lines and leaves marked ancestors untouched.
+        for(r=1;r<=NR;r++){
+            s=line[r]
+            if(carried[r]){
+                print s > ex
+                if(carryglyph(s)) sub(/\[.\]/,"[>]",s)
+            }
+            print s
+        }
     }
   ' "$file" > "$tmp"
   [ -s "$extract" ] && cat "$tmp" > "$file"
@@ -636,6 +666,12 @@ _mvtodo_extract() {
 # Drop lines from the extract file (arg 2) whose checkbox text already exists in
 # today's Todo section (arg 1), printing the surviving block to stdout. Compares
 # the trimmed text after the checkbox glyph; non-checkbox lines always pass.
+# Dedup is subtree-aware: a duplicate checkbox line is dropped only when it and
+# its whole carried subtree are also duplicates, so a parent is never dropped
+# while a novel child survives (which would re-orphan the child). In the rare
+# overlap case -- a context parent already present today with a fresh child
+# beneath it -- the parent is kept as structure even though it duplicates an
+# existing line, preferring no-orphans over avoiding a duplicate parent.
 _mvtodo_filter_dupes() {
   local today="$1" extract="$2"
   T="$today" awk '
@@ -644,7 +680,7 @@ _mvtodo_filter_dupes() {
         if(match(line,/^[[:space:]]*[-*+][[:space:]]+\[.\][[:space:]]*/)){
             s=substr(line,RLENGTH+1); return trim(s) }
         return "" }
-    BEGIN{ tf=ENVIRON["T"]; grab=0; level=0 }
+    BEGIN{ tf=ENVIRON["T"]; grab=0; level=0; n=0 }
     FILENAME==tf {
         if($0 ~ /^#{1,6}[[:space:]]/){
             match($0,/^#+/); h=RLENGTH; text=substr($0,h+1)
@@ -655,7 +691,27 @@ _mvtodo_filter_dupes() {
         if(grab){ k=ckey($0); if(k!="") seen[k]=1 }
         next
     }
-    { k=ckey($0); if(k!="" && (k in seen)) next; print }
+    # buffer the extract block; record each line indent, checkbox-ness, dupe-ness
+    { n++; buf[n]=$0
+      match($0,/^[[:space:]]*/); w[n]=RLENGTH
+      k=ckey($0)
+      if($0 ~ /^[[:space:]]*[-*+][[:space:]]+\[.\]/){ isbox[n]=1; dupe[n]=(k!="" && (k in seen)) }
+    }
+    END{
+        # parent pointer per line via an indent stack (the extract holds only
+        # list lines, so nesting is contiguous)
+        sp=0
+        for(r=1;r<=n;r++){
+            while(sp>0 && stackw[sp]>=w[r]) sp--
+            parent[r]=(sp>0?stacki[sp]:0)
+            sp++; stacki[sp]=r; stackw[sp]=w[r]
+            survive[r]=(isbox[r] ? !dupe[r] : 1)     # non-dupe or non-checkbox survives
+        }
+        # a surviving line keeps its ancestors alive (children precede parents in
+        # this reverse walk, so parents accumulate their descendants first)
+        for(r=n;r>=1;r--) if(survive[r] && parent[r]>0) survive[parent[r]]=1
+        for(r=1;r<=n;r++) if(survive[r]) print buf[r]
+    }
   ' "$today" "$extract"
 }
 
@@ -693,11 +749,15 @@ _mvtodo_insert() {
 
 # mvtodo [<offset>|yester|ere]
 #   Copy unfinished todos ([ ], [/], [!]) from the most recent prior daily note
-#   into today's Todo section, preserving nesting and each item's glyph, and mark
-#   the originals forwarded ([>]) in that prior note. Duplicates already present in
-#   today's Todo are skipped; re-running carries nothing (idempotent).
-#   With an arg, force the source day instead of scanning back: yester (-1),
-#   ere (-2), or an explicit negative offset like -3.
+#   into today's Todo section, preserving nesting and each item's glyph. Each
+#   carried item brings its full stack -- its subtree and its ancestor chain --
+#   so an open item under a completed parent keeps that parent as context instead
+#   of arriving as an orphaned indent. Marked ancestors keep their glyph on both
+#   notes; in the prior note the open (carry-glyph) boxes are marked forwarded
+#   ([>]). Duplicates already present in today's Todo are skipped (subtree-aware,
+#   so a parent is never dropped while a fresh child survives); re-running carries
+#   nothing (idempotent). With an arg, force the source day instead of scanning
+#   back: yester (-1), ere (-2), or an explicit negative offset like -3.
 mvtodo() {
   local today; today="$(_daily_ensure_file)" || return 1
   _daily_ensure_section "$today" Todo
@@ -749,8 +809,8 @@ drecap() {
 
 wrecap() {
   local weeks="${1:-1}"
-  case "$weeks" in ''|*[!0-9]*) echo "wsum: weeks must be a positive integer" >&2; return 2 ;; esac
-  [ "$weeks" -ge 1 ] || { echo "wsum: weeks must be >= 1" >&2; return 2; }
+  case "$weeks" in ''|*[!0-9]*) echo "wrecap: weeks must be a positive integer" >&2; return 2 ;; esac
+  [ "$weeks" -ge 1 ] || { echo "wrecap: weeks must be >= 1" >&2; return 2; }
 
   cd notes
   local example="
