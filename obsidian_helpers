@@ -579,7 +579,87 @@ _daily_view() {
   | mdviewer
 }
 
+# Print plain-text usage for a daily command and return 0. <kind> is one of the
+# recap-family names (recap|mvtodo|wrecap|srecap) or a section wrapper
+# (todo|done|note). Callers guard on a leading -h/--help before any side effect.
+_daily_help() {
+  case "$1" in
+    recap) cat <<'EOF'
+drecap — show a daily-note recap (today or a past day)
+
+usage:
+  drecap                today's note (created if missing)
+  drecap yester         yesterday (-1)
+  drecap ere            day before yesterday (-2)
+  drecap -N             N days ago (e.g. -3)
+
+Past days are read-only and error if the note is absent.
+EOF
+      return 0 ;;
+    mvtodo) cat <<'EOF'
+mvtodo — carry unfinished todos from the most recent prior note into today
+
+usage:
+  mvtodo                pull from the most recent prior note (scans back ≤60 days)
+  mvtodo yester         force source = yesterday (-1)
+  mvtodo ere            force source = day before (-2)
+  mvtodo -N             force source = N days ago
+
+Carries open [ ], in-progress [/] and important [!] items with their subtree +
+ancestor context; marks them forwarded [>] in the source. Duplicates already in
+today's Todo are skipped; re-running is idempotent.
+EOF
+      return 0 ;;
+    wrecap) cat <<'EOF'
+wrecap — generate a work summary from your notes via Claude
+
+usage:
+  wrecap [weeks]           summarize the past <weeks> weeks (default 1)
+  wrecap [weeks] --slack   format as a Slack status update (default: Tier-1 template)
+
+<weeks> is a positive integer.
+EOF
+      return 0 ;;
+    srecap) cat <<'EOF'
+srecap — sprint recap: a wrecap over the last 3 weeks (~one sprint)
+
+usage:
+  srecap [--slack]      same as `wrecap 3 [--slack]`
+EOF
+      return 0 ;;
+  esac
+
+  # section wrappers: todo|done|note
+  local kind="$1" cmd sect item
+  case "$kind" in
+    todo) cmd=dtodo; sect=Todo;  item=checkbox ;;
+    done) cmd=ddone; sect=Done;  item=bullet   ;;
+    note) cmd=dnote; sect=Notes; item=bullet   ;;
+  esac
+  cat <<EOF
+$cmd — manage the $sect section of today's daily note
+
+usage:
+  $cmd                           show the $sect section
+  $cmd <text> [@link]            add a $item (trailing @token = [[wiki-link]])
+  $cmd sub <i> <text> [@link]    add a $item nested under item <i>
+  $cmd del <i...>                delete item(s) and their subtree
+EOF
+  if [ "$kind" = todo ]; then
+    cat <<'EOF'
+  dtodo <state> <i...> [--note <text>]   set checkbox glyph for item(s)
+        states: done check in-progress forward cancel important uncheck
+  dtodo note <i> <text>          append a note to item <i>, glyph unchanged
+EOF
+  fi
+  cat <<'EOF'
+
+<i> indices are the numbers shown in the recap gutter.
+EOF
+}
+
 daily-done() {
+  case "${1-}" in -h|--help) _daily_help done; return 0 ;; esac
   local file; file="$(_daily_ensure_file)" || return 1
   _daily_ensure_section "$file" Done
 
@@ -602,6 +682,7 @@ daily-done() {
 }
 
 daily-note() {
+  case "${1-}" in -h|--help) _daily_help note; return 0 ;; esac
   local file; file="$(_daily_ensure_file)" || return 1
   _daily_ensure_section "$file" Notes
 
@@ -624,6 +705,7 @@ daily-note() {
 }
 
 daily-todo() {
+  case "${1-}" in -h|--help) _daily_help todo; return 0 ;; esac
   local file; file="$(_daily_ensure_file)" || return 1
   _daily_ensure_section "$file" Todo
 
@@ -678,6 +760,7 @@ daily-todo() {
 daily-recap() {
   local off
   case "${1-}" in
+    -h|--help)         _daily_help recap; return 0 ;;
     ''|0|today)        off=0 ;;
     yester|yesterday)  off=-1 ;;
     ere|ereyesterday)  off=-2 ;;
@@ -876,6 +959,7 @@ _mvtodo_insert() {
 #   nothing (idempotent). With an arg, force the source day instead of scanning
 #   back: yester (-1), ere (-2), or an explicit negative offset like -3.
 mvtodo() {
+  case "${1-}" in -h|--help) _daily_help mvtodo; return 0 ;; esac
   local today; today="$(_daily_ensure_file)" || return 1
   _daily_ensure_section "$today" Todo
 
@@ -925,6 +1009,7 @@ drecap() {
 }
 
 wrecap() {
+  case "${1-}" in -h|--help) _daily_help wrecap; return 0 ;; esac
   local weeks="" slack=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -1019,5 +1104,6 @@ Operational section:
 }
 
 srecap() {
+  case "${1-}" in -h|--help) _daily_help srecap; return 0 ;; esac
   wrecap "$@" 3
 }
