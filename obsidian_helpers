@@ -6,7 +6,8 @@
 #   daily                             -> create/open today's note
 #   daily recap                       -> full note (numbered lists)
 #   daily <section> recap             -> one section (falls back to full note)
-#   daily <section> mark <i...> <state>  state: in-progress|done|check|forward|cancel|important|uncheck
+#   daily <section> mark <i...> <state> [--note <text>]  state: in-progress|done|check|forward|cancel|important|uncheck
+#   daily <section> note <i> "text"   append a note to item <i>, glyph unchanged
 #   daily <section> add <checkbox|bullet> "text" [--tag <tag>] [--link <note>] [--under <i>]
 #   daily <section> delete <i...>
 #
@@ -15,6 +16,11 @@
 # --under <i> nests the new item beneath list item <i> (the dnote/dtodo/ddone
 # wrappers expose this as `sub <i> "text"`). delete removes an item's whole
 # subtree; mark affects only the targeted line, not its nested children.
+# mark --note <text> appends a Dataview inline field "(note:: text)" to each
+# marked line (text runs to end-of-line, no quotes needed). The `note` verb does
+# the same append on its own, without changing the item's glyph. Obsidian's reading
+# view hides the key and shows just "text"; Dataview aggregates repeated notes
+# on a line into a list, so stacking marks accumulates queryable notes.
 # Checkbox glyphs follow Obsidian's convention:
 #   done -> [x]  in-progress -> [/]  forward -> [>]  cancel -> [-]  important -> [!]
 # Override the target file with $DAILY_NOTE.
@@ -170,7 +176,8 @@ usage:
   daily
   daily recap
   daily <section> recap
-  daily <section> mark <index...> <in-progress|done|check|forward|cancel|important|uncheck>
+  daily <section> mark <index...> <in-progress|done|check|forward|cancel|important|uncheck> [--note <text>]
+  daily <section> note <index> <text>
   daily <section> add <checkbox|bullet> "text" [--tag <tag>] [--link <note>] [--under <index>]
   daily <section> delete <index...>
 EOF
@@ -238,6 +245,16 @@ _daily_recap() {
 
 _daily_mark() {
     local file="$1" section="$2"; shift 2
+    # Peel off an optional "--note <text...>": everything after --note runs to
+    # end-of-line as the note (spaces allowed, no quotes), leaving the usual
+    # "<index...> <state>" positionals behind.
+    local note="" _args=() _seen=0 _a
+    for _a in "$@"; do
+        if [ "$_seen" = 1 ]; then note="${note:+$note }$_a"
+        elif [ "$_a" = "--note" ]; then _seen=1
+        else _args+=( "$_a" ); fi
+    done
+    set -- "${_args[@]}"
     # trailing arg is the target state; every arg before it is a list index
     if [ "$#" -lt 2 ]; then _daily_usage; return 2; fi
     local status="${@: -1}"
@@ -247,7 +264,7 @@ _daily_mark() {
         case "$i" in ''|*[!0-9]*) echo "daily: index must be a positive integer" >&2; return 2 ;; esac
     done
 
-    local mark
+    local mark keep=""
     case "$status" in
         done|check)  mark='x' ;;
         in-progress) mark='/' ;;
@@ -255,13 +272,15 @@ _daily_mark() {
         cancel)      mark='-' ;;
         important)   mark='!' ;;
         uncheck)     mark=' ' ;;
-        *) echo "daily: state must be one of in-progress, done, check, forward, cancel, important, uncheck" >&2; return 2 ;;
+        note)        mark=''; keep=1 ;;   # append the note only; leave the glyph untouched
+        *) echo "daily: state must be one of in-progress, done, check, forward, cancel, important, uncheck, note" >&2; return 2 ;;
     esac
+    if [ -n "$keep" ] && [ -z "$note" ]; then echo "daily: note state requires --note <text>" >&2; return 2; fi
 
     local tmp; tmp="$(mktemp)"
-    WANT="$section" IDXS="${idxs[*]}" MARK="$mark" awk '
+    WANT="$section" IDXS="${idxs[*]}" MARK="$mark" NOTE="$note" KEEP="$keep" awk '
         function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
-        BEGIN{ want=tolower(trim(ENVIRON["WANT"])); mark=ENVIRON["MARK"]
+        BEGIN{ want=tolower(trim(ENVIRON["WANT"])); mark=ENVIRON["MARK"]; note=ENVIRON["NOTE"]; keep=ENVIRON["KEEP"]
                ni=split(ENVIRON["IDXS"], a, " "); for(i=1;i<=ni;i++) target[a[i]+0]=1
                grab=0; entered=0; level=0; n=0; found=0; marked=0 }
         /^#{1,6}[[:space:]]/{
@@ -275,12 +294,15 @@ _daily_mark() {
                 if($0 ~ /^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]/){
                     if(++n in target){
                         line=$0
-                        if(line ~ /^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]+\[.\]/)
-                            sub(/\[.\]/, "[" mark "]", line)
-                        else if(line ~ /^[[:space:]]*[-*+][[:space:]]+/)
-                            sub(/^[[:space:]]*[-*+][[:space:]]+/, "&[" mark "] ", line)
-                        else
-                            sub(/^[[:space:]]*[0-9]+[.)][[:space:]]+/, "&[" mark "] ", line)
+                        if(!keep){
+                            if(line ~ /^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]+\[.\]/)
+                                sub(/\[.\]/, "[" mark "]", line)
+                            else if(line ~ /^[[:space:]]*[-*+][[:space:]]+/)
+                                sub(/^[[:space:]]*[-*+][[:space:]]+/, "&[" mark "] ", line)
+                            else
+                                sub(/^[[:space:]]*[0-9]+[.)][[:space:]]+/, "&[" mark "] ", line)
+                        }
+                        if(note != "") line = line " (note:: " note ")"
                         print line; marked++; next
                     }
                 } else n=0
@@ -439,6 +461,17 @@ _daily_add() {
     cat "$tmp" > "$file" && rm -f "$tmp"
 }
 
+# Append a note to a single list item without changing its glyph. Reuses the
+# mark machinery via the glyph-preserving `note` state, so the note lands as the
+# same "(note:: text)" Dataview field. Single index, text runs to end-of-line.
+_daily_note() {
+    local file="$1" section="$2" idx="$3"; shift 3
+    case "$idx" in ''|*[!0-9]*) echo "daily: index must be a positive integer" >&2; return 2 ;; esac
+    local text="$*"
+    [ -n "$text" ] || { echo "daily: note requires text" >&2; return 2; }
+    _daily_mark "$file" "$section" "$idx" note --note "$text"
+}
+
 daily() {
     # bare `daily` -> create/open today's daily note
     if [ "$#" -eq 0 ]; then
@@ -460,6 +493,7 @@ daily() {
     case "$verb" in
         recap) _daily_recap "$file" "$section" ;;
         mark)   _daily_mark   "$file" "$section" "$@" ;;
+        note)   _daily_note   "$file" "$section" "$@" ;;
         add)    _daily_add    "$file" "$section" "$@" ;;
         delete) _daily_delete "$file" "$section" "$@" ;;
         *) echo "daily: unknown verb '$verb'" >&2; _daily_usage; return 2 ;;
@@ -601,13 +635,29 @@ daily-todo() {
       case $1 in
         del)                                               verb=del ;;
         sub)                                               verb=sub ;;
+        note)                                              verb=note ;;
         done|check|in-progress|forward|cancel|important|uncheck) verb=mark ;;
       esac
     fi
 
     case $verb in
       del)  daily todo delete "${@:2}" ;;
-      mark) daily todo mark "${@:2}" "$1" ;;
+      note) daily todo note "$2" "${@:3}" ;;
+      mark) local _st="$1"; shift
+            # split the remaining args into indices and an optional --note tail,
+            # forwarding as "<index...> <state> --note <note>" so the state stays
+            # the trailing positional and the note arrives as one argument.
+            local _idx=() _note=() _seen=0 _a
+            for _a in "$@"; do
+              if [ "$_seen" = 1 ]; then _note+=( "$_a" )
+              elif [ "$_a" = "--note" ]; then _seen=1
+              else _idx+=( "$_a" ); fi
+            done
+            if [ "$_seen" = 1 ]; then
+              daily todo mark "${_idx[@]}" "$_st" --note "${_note[*]}"
+            else
+              daily todo mark "${_idx[@]}" "$_st"
+            fi ;;
       sub)  _daily_split "${@:3}"
             daily todo add checkbox "$_TEXT" --under "$2" ${_LINK:+--link "$_LINK"} ;;
       *)    _daily_split "$@"
